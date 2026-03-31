@@ -16,9 +16,31 @@ Cache misses trigger transparent S3 fetches with adaptive prefetch. Writes go to
 
 ## Performance
 
-**TODO**: Initial Tigris benchmarks pending. See ROADMAP.md.
+100K persons, 1M follow edges, 25MB graph database on [Tigris](https://tigris.dev) (IAD). Benchmark runs 9 Cypher queries from the [kuzudb-study](https://thedataquarry.com/blog/embedded-db-2/) at four cache levels.
 
-The turbolite equivalent achieves 77-586ms cold query latency on a 1.5GB SQLite database from S3 Express. Graph databases have different access patterns (columnar + CSR vs B-tree), so performance profiles will differ.
+| Query | Cold (S3) | Warm (local) | Neo4j 5.11 |
+|---|---|---|---|
+| Q1: Top 3 most-followed | 328ms | 274ms | 1,890ms |
+| Q2: City of most-followed | 925ms | 680ms | 694ms |
+| Q3: Youngest cities US | 59ms | 44ms | 44ms |
+| Q4: Persons 30-40 by country | 23ms | 11ms | 47ms |
+| Q5: Male fine diners London | 1,300ms | 35ms | 9ms |
+| Q6: Female tennis by city | 1,300ms | 90ms | 23ms |
+| Q7: US photographers 23-30 | 1,300ms | 30ms | 163ms |
+| Q8: 2-hop path count | 27ms | 21ms | 3,453ms |
+| Q9: Filtered 2-hop paths | 113ms | 88ms | 4,271ms |
+
+**Cold** = every page fetched from S3 (no local cache). 
+
+**Warm** = all pages on local NVMe disk.
+
+Key results:
+- **Q8 is 164x faster than Neo4j** (21ms vs 3.5s) for 2-hop graph traversals
+- **7 of 9 queries faster than Neo4j** at warm cache level
+- **Sub-330ms cold** for most queries from Tigris (~25ms TTFB per S3 GET)
+- Q5/Q6/Q7 cold penalty (~1.3s) is from 40 sequential seekable frame range GETs; full-group prefetch would eliminate this
+
+Hardware: Fly.io perf-8x (8 CPU, 64GB RAM), Tigris S3 same-region (IAD).
 
 ## Quick Start
 
@@ -37,7 +59,12 @@ make test-s3
 
 # Build benchmark (needs LadybugDB source tree)
 make bench LADYBUG_DIR=../ladybug-fork
+
+# Deploy benchmark to Fly.io
+fly deploy --config bench/fly.toml --remote-only
 ```
+
+See [bench/README.md](bench/README.md) for benchmark details and configuration.
 
 ## Architecture
 
