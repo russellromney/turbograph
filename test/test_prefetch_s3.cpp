@@ -16,7 +16,7 @@
 #include <string>
 #include <unistd.h>
 
-#include <zstd.h>
+#include "turbograph_zstd.h"
 
 using namespace lbug::tiered;
 

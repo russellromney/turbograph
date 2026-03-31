@@ -14,7 +14,7 @@
 #include <linux/falloc.h>
 #endif
 
-#include <zstd.h>
+#include "turbograph_zstd.h"
 
 namespace lbug {
 namespace tiered {

@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
-#include <zstd.h>
+#include "turbograph_zstd.h"
 
 namespace lbug {
 namespace tiered {
