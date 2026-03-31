@@ -552,31 +552,27 @@ int main(int argc, char** argv) {
         (unsigned long long)(dbSizeBytes / (1024 * 1024)),
         (unsigned long long)bufferPoolMB);
 
-    // Phase 2: Per-query warm/cold benchmark.
-    //   Each query gets its own DB open → fresh Kuzu buffer pool every time.
-    //   Warm: page bitmap populated, local cache file has pages, buffer pool empty.
-    //   Cold: page bitmap cleared, buffer pool empty. All page reads go to S3.
-    LatencyStats warmStats[NUM_QUERIES];
-    LatencyStats coldStats[NUM_QUERIES];
-    int iterations = std::max(cfg.warmIterations, cfg.coldIterations);
-    std::printf("  Running benchmark (%d iterations, per-query open/close)...\n", iterations);
+    // Phase 2: Four-level benchmark.
+    //
+    // Sequence (one shared TFS + DB for all phases):
+    //   1. COLD:     clearCacheAll() between iterations. Nothing cached.
+    //   2. INTERIOR: clearCacheKeepStructural() between iterations. Catalog+metadata cached.
+    //   3. INDEX:    clearCacheKeepIndex() between iterations. Structural+index cached.
+    //   4. WARM:     no cache clearing. Close/reopen Connection to nuke buffer pool.
+    //
+    // After cold phase, transition to interior by doing clearCacheKeepStructural().
+    // After interior phase, transition to index by doing clearCacheKeepIndex().
+    // After index phase, all pages are cached for warm.
 
-    for (int iter = 0; iter < iterations; iter++) {
-        // --- WARM: bitmap populated, local cache file has pages, fresh buffer pool ---
-        for (int q = 0; q < NUM_QUERIES; q++) {
-            std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
-            lbug::tiered::S3Client* s3Ptr = nullptr;
-            if (!localMode) {
-                auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
-                s3Ptr = &tfs->s3();
-                s3Ptr->resetCounters();
-                fsList.push_back(std::move(tfs));
-            }
-            lbug::main::SystemConfig sysCfg;
-            sysCfg.bufferPoolSize = bufferPoolBytes;
-            sysCfg.forceCheckpointOnClose = false;
-            sysCfg.autoCheckpoint = false;
-            lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
+    LatencyStats coldStats[NUM_QUERIES];
+    LatencyStats interiorStats[NUM_QUERIES];
+    LatencyStats indexStats[NUM_QUERIES];
+    LatencyStats warmStats[NUM_QUERIES];
+
+    auto runQuery = [&](lbug::main::Database& db, lbug::tiered::S3Client* s3Ptr,
+        int q, int iter, const char* label, LatencyStats* stats) {
+        try {
+            if (s3Ptr) s3Ptr->resetCounters();
             lbug::main::Connection conn(&db);
 
             auto start = Clock::now();
@@ -584,65 +580,95 @@ int main(int argc, char** argv) {
             auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                 Clock::now() - start).count();
             if (!result->isSuccess()) {
-                std::fprintf(stderr, "  FAIL [warm] %s: %s\n",
-                    QUERIES[q].name, result->getErrorMessage().c_str());
+                std::fprintf(stderr, "  FAIL [%s] %s: %s\n",
+                    label, QUERIES[q].name, result->getErrorMessage().c_str());
             }
             uint64_t s3Reqs = s3Ptr ? s3Ptr->fetchCount.load() : 0;
             uint64_t s3Bytes = s3Ptr ? s3Ptr->fetchBytes.load() : 0;
-            warmStats[q].samples.push_back(us);
-            std::printf("    [warm] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
-                iter, QUERIES[q].name, (long long)(us / 1000),
+            stats[q].samples.push_back(us);
+            std::printf("    [%-8s] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
+                label, iter, QUERIES[q].name, (long long)(us / 1000),
                 (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  CRASH [%s] %s: %s\n", label, QUERIES[q].name, e.what());
+        }
+    };
+
+    {
+        // Single TFS + DB for all four phases.
+        std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
+        lbug::tiered::TieredFileSystem* tfsPtr = nullptr;
+        lbug::tiered::S3Client* s3Ptr = nullptr;
+        if (!localMode) {
+            auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
+            tfsPtr = tfs.get();
+            s3Ptr = &tfs->s3();
+            fsList.push_back(std::move(tfs));
+        }
+        lbug::main::SystemConfig sysCfg;
+        sysCfg.bufferPoolSize = bufferPoolBytes;
+        sysCfg.forceCheckpointOnClose = false;
+        sysCfg.autoCheckpoint = false;
+
+        // Track structural pages during Database construction.
+        if (tfsPtr) tfsPtr->beginTrackStructural();
+        lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
+        if (tfsPtr) tfsPtr->endTrack();
+
+        // Track index pages during a warmup query (runs all queries once).
+        if (tfsPtr) tfsPtr->beginTrackIndex();
+        std::printf("  Warmup (tracking index pages)...\n");
+        {
+            lbug::main::Connection conn(&db);
+            for (int q = 0; q < NUM_QUERIES; q++) {
+                auto r = conn.query(QUERIES[q].cypher);
+                if (!r->isSuccess()) {
+                    std::fprintf(stderr, "  FAIL [warmup] %s: %s\n",
+                        QUERIES[q].name, r->getErrorMessage().c_str());
+                }
+            }
+        }
+        if (tfsPtr) tfsPtr->endTrack();
+
+        std::printf("  Running benchmark (%d/%d iterations)...\n",
+            cfg.coldIterations, cfg.warmIterations);
+
+        // --- Phase 1: COLD (nothing cached) ---
+        for (int iter = 0; iter < cfg.coldIterations; iter++) {
+            if (tfsPtr) tfsPtr->clearCacheAll();
+            for (int q = 0; q < NUM_QUERIES; q++) {
+                runQuery(db, s3Ptr, q, iter, "cold", coldStats);
+            }
         }
 
-        // --- COLD: structural pages cached, data pages evicted, fresh buffer pool ---
-        // One TFS + DB for all cold queries. Structural pages (catalog, metadata)
-        // are tracked during DB open and preserved. Data pages are evicted before
-        // each query so they must be re-fetched from S3.
-        {
-            std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
-            lbug::tiered::TieredFileSystem* tfsPtr = nullptr;
-            lbug::tiered::S3Client* s3Ptr = nullptr;
-            if (!localMode) {
-                auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
-                tfsPtr = tfs.get();
-                s3Ptr = &tfs->s3();
-                fsList.push_back(std::move(tfs));
-            }
-            lbug::main::SystemConfig sysCfg;
-            sysCfg.bufferPoolSize = bufferPoolBytes;
-            sysCfg.forceCheckpointOnClose = false;
-            sysCfg.autoCheckpoint = false;
+        // Transition: keep structural for interior phase.
+        if (tfsPtr) tfsPtr->clearCacheKeepStructural();
 
-            // Track structural pages during Database construction.
-            if (tfsPtr) tfsPtr->beginTrackStructural();
-            lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
-            if (tfsPtr) tfsPtr->endTrackStructural();
-
+        // --- Phase 2: INTERIOR (structural cached, index+data evicted) ---
+        for (int iter = 0; iter < cfg.coldIterations; iter++) {
+            if (tfsPtr) tfsPtr->clearCacheKeepStructural();
             for (int q = 0; q < NUM_QUERIES; q++) {
-                try {
-                    // Evict data pages, keep structural.
-                    if (tfsPtr) tfsPtr->clearCacheDataOnly();
-                    if (s3Ptr) s3Ptr->resetCounters();
-                    lbug::main::Connection conn(&db);
+                runQuery(db, s3Ptr, q, iter, "interior", interiorStats);
+            }
+        }
 
-                    auto start = Clock::now();
-                    auto result = conn.query(QUERIES[q].cypher);
-                    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        Clock::now() - start).count();
-                    if (!result->isSuccess()) {
-                        std::fprintf(stderr, "  FAIL [cold] %s: %s\n",
-                            QUERIES[q].name, result->getErrorMessage().c_str());
-                    }
-                    uint64_t s3Reqs = s3Ptr ? s3Ptr->fetchCount.load() : 0;
-                    uint64_t s3Bytes = s3Ptr ? s3Ptr->fetchBytes.load() : 0;
-                    coldStats[q].samples.push_back(us);
-                    std::printf("    [cold] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
-                        iter, QUERIES[q].name, (long long)(us / 1000),
-                        (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
-                } catch (const std::exception& e) {
-                    std::fprintf(stderr, "  CRASH [cold] %s: %s\n", QUERIES[q].name, e.what());
-                }
+        // Transition: keep structural+index for index phase.
+        if (tfsPtr) tfsPtr->clearCacheKeepIndex();
+
+        // --- Phase 3: INDEX (structural+index cached, data evicted) ---
+        for (int iter = 0; iter < cfg.coldIterations; iter++) {
+            if (tfsPtr) tfsPtr->clearCacheKeepIndex();
+            for (int q = 0; q < NUM_QUERIES; q++) {
+                runQuery(db, s3Ptr, q, iter, "index", indexStats);
+            }
+        }
+
+        // --- Phase 4: WARM (everything cached, nuke buffer pool via Connection close) ---
+        // Don't clear cache. All pages on disk. Each query gets a fresh Connection
+        // (which resets Kuzu's buffer pool) to measure pure compute + pread latency.
+        for (int iter = 0; iter < cfg.warmIterations; iter++) {
+            for (int q = 0; q < NUM_QUERIES; q++) {
+                runQuery(db, s3Ptr, q, iter, "warm", warmStats);
             }
         }
     }
@@ -660,20 +686,19 @@ int main(int argc, char** argv) {
     }
     std::printf("\n");
 
-    std::printf("  %-28s %10s %10s %10s\n", "", "Warm p50", "Cold p50", "Ratio");
-    std::printf("  %-28s %10s %10s %10s\n", "", "--------", "--------", "-----");
+    std::printf("  %-28s %10s %10s %10s %10s %10s\n",
+        "", "Cold p50", "Interior", "Index", "Warm p50", "Neo4j");
+    std::printf("  %-28s %10s %10s %10s %10s %10s\n",
+        "", "--------", "--------", "-----", "--------", "-----");
 
     for (int q = 0; q < NUM_QUERIES; q++) {
-        auto wq = warmStats[q].p50();
-        auto cq = coldStats[q].p50();
-        char ratio[16] = "";
-        if (wq > 0)
-            std::snprintf(ratio, sizeof(ratio), "%5.1fx", (double)cq / (double)wq);
-        std::printf("  %-28s %10s %10s %10s\n",
+        std::printf("  %-28s %10s %10s %10s %10s %10s\n",
             QUERIES[q].name,
-            formatUs(wq).c_str(),
-            formatUs(cq).c_str(),
-            ratio);
+            formatUs(coldStats[q].p50()).c_str(),
+            formatUs(interiorStats[q].p50()).c_str(),
+            formatUs(indexStats[q].p50()).c_str(),
+            formatUs(warmStats[q].p50()).c_str(),
+            formatUs(NEO4J_US[q]).c_str());
     }
     std::printf("\n");
 

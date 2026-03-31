@@ -370,24 +370,53 @@ void TieredFileSystem::truncate(common::FileInfo& fileInfo, uint64_t size) const
     }
 }
 
+// --- Page classification tracking ---
+
+static void initTrackBitmap(std::unique_ptr<PageBitmap>& bm,
+    const std::string& path, uint64_t pageCount) {
+    bm = std::make_unique<PageBitmap>(std::filesystem::path(path));
+    if (pageCount > 0) bm->resize(pageCount);
+}
+
 void TieredFileSystem::beginTrackStructural() {
     auto* afi = activeFileInfo_.load();
     if (!afi) return;
-    std::lock_guard lock(afi->structuralMu);
-    // Create a fresh structural bitmap.
-    auto bitmapPath = std::filesystem::path(config_.cacheDir) / "structural_bitmap";
-    afi->structuralPages = std::make_unique<PageBitmap>(bitmapPath);
-    if (afi->manifest.pageCount > 0) {
-        afi->structuralPages->resize(afi->manifest.pageCount);
-    }
-    afi->trackingStructural = true;
+    std::lock_guard lock(afi->trackMu);
+    initTrackBitmap(afi->structuralPages,
+        config_.cacheDir + "/structural_bitmap", afi->manifest.pageCount);
+    afi->trackMode = TieredFileInfo::TrackMode::STRUCTURAL;
 }
 
-void TieredFileSystem::endTrackStructural() {
+void TieredFileSystem::beginTrackIndex() {
     auto* afi = activeFileInfo_.load();
     if (!afi) return;
-    std::lock_guard lock(afi->structuralMu);
-    afi->trackingStructural = false;
+    std::lock_guard lock(afi->trackMu);
+    initTrackBitmap(afi->indexPages,
+        config_.cacheDir + "/index_bitmap", afi->manifest.pageCount);
+    afi->trackMode = TieredFileInfo::TrackMode::INDEX;
+}
+
+void TieredFileSystem::endTrack() {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return;
+    std::lock_guard lock(afi->trackMu);
+    afi->trackMode = TieredFileInfo::TrackMode::NONE;
+}
+
+// --- Selective cache eviction ---
+
+// Helper: rebuild bitmap keeping only pages present in the given preserve bitmaps.
+static void rebuildBitmap(PageBitmap& bitmap,
+    PageBitmap* preserve1, PageBitmap* preserve2) {
+    auto pageCount = bitmap.pageCount();
+    bitmap.clear();
+    for (uint64_t p = 0; p < pageCount; p++) {
+        if ((preserve1 && preserve1->isPresent(p)) ||
+            (preserve2 && preserve2->isPresent(p))) {
+            bitmap.markPresent(p);
+        }
+    }
+    bitmap.persist();
 }
 
 void TieredFileSystem::clearCacheAll() {
@@ -412,7 +441,7 @@ void TieredFileSystem::clearCacheAll() {
     }
 }
 
-void TieredFileSystem::clearCacheDataOnly() {
+void TieredFileSystem::clearCacheKeepStructural() {
     drainPrefetchAndWait();
     auto* afi = activeFileInfo_.load();
     if (!afi) return;
@@ -420,35 +449,26 @@ void TieredFileSystem::clearCacheDataOnly() {
     afi->resetGroupStates();
     afi->consecutiveMisses = 0;
 
-    // Rebuild bitmap: keep only structural pages, clear everything else.
     if (afi->bitmap && afi->structuralPages) {
-        auto pageCount = afi->bitmap->pageCount();
-        afi->bitmap->clear();
-        // Re-mark structural pages as present.
-        for (uint64_t p = 0; p < pageCount; p++) {
-            if (afi->structuralPages->isPresent(p)) {
-                afi->bitmap->markPresent(p);
-            }
-        }
-        afi->bitmap->persist();
-
-        // Re-mark group states for groups that have at least one structural page.
-        for (uint64_t p = 0; p < pageCount; p++) {
-            if (afi->structuralPages->isPresent(p)) {
-                auto gid = p / afi->pagesPerGroup;
-                // Don't mark PRESENT since not all pages in the group may be cached.
-                // Leave as NONE so individual page reads go through the normal path
-                // (bitmap hit -> pread for structural, bitmap miss -> S3 for data).
-            }
-        }
+        rebuildBitmap(*afi->bitmap, afi->structuralPages.get(), nullptr);
     } else if (afi->bitmap) {
-        // No structural tracking -- fall back to clearing everything.
         afi->bitmap->clear();
         afi->bitmap->persist();
     }
+}
 
-    // Don't truncate local file -- structural pages are still there.
-    // Data pages will be re-fetched from S3 on next read (bitmap says not present).
+void TieredFileSystem::clearCacheKeepIndex() {
+    drainPrefetchAndWait();
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return;
+
+    afi->resetGroupStates();
+    afi->consecutiveMisses = 0;
+
+    if (afi->bitmap) {
+        rebuildBitmap(*afi->bitmap,
+            afi->structuralPages.get(), afi->indexPages.get());
+    }
 }
 
 void TieredFileSystem::evictLocalGroup(uint64_t pageGroupId) {
@@ -637,11 +657,13 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
 // --- readOnePage: sync fetch + async prefetch ---
 
 std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t pageNum) const {
-    // Track structural pages: any page read while tracking is active is structural.
+    // Track page classification: mark page as structural or index depending on mode.
     {
-        std::lock_guard lock(ti.structuralMu);
-        if (ti.trackingStructural && ti.structuralPages) {
+        std::lock_guard lock(ti.trackMu);
+        if (ti.trackMode == TieredFileInfo::TrackMode::STRUCTURAL && ti.structuralPages) {
             ti.structuralPages->markPresent(pageNum);
+        } else if (ti.trackMode == TieredFileInfo::TrackMode::INDEX && ti.indexPages) {
+            ti.indexPages->markPresent(pageNum);
         }
     }
 

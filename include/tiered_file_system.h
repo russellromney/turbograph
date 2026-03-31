@@ -75,11 +75,14 @@ struct TieredFileInfo : public common::FileInfo {
 
     mutable uint8_t consecutiveMisses = 0; // For hop-based adaptive prefetch.
 
-    // Structural page tracking: pages read while trackingStructural is true
-    // are marked as structural and preserved by clearCacheDataOnly().
-    mutable std::mutex structuralMu;
-    std::unique_ptr<PageBitmap> structuralPages; // Pages to preserve on data-only clear.
-    bool trackingStructural = false;
+    // Page classification bitmaps for selective cache eviction.
+    // Structural: page 0, catalog, metadata -- read during Database() construction.
+    // Index: PIP pages, hash index data -- read during first query execution.
+    // Pages not in either bitmap are data pages (column chunks, CSR edges, overflow).
+    mutable std::mutex trackMu;
+    std::unique_ptr<PageBitmap> structuralPages;
+    std::unique_ptr<PageBitmap> indexPages;
+    enum class TrackMode : uint8_t { NONE, STRUCTURAL, INDEX } trackMode = TrackMode::NONE;
 
     // Pending page groups that need background upload.
     mutable std::mutex pendingMu;
@@ -127,18 +130,22 @@ public:
     // Called by TieredFileInfo destructor before freeing the file info.
     void drainPrefetchAndWait() const;
 
-    // Start tracking structural pages. Every page read while tracking is
-    // active will be marked as structural (preserved by clearCacheDataOnly).
-    // Call before Database() construction, stop after.
+    // --- Page classification tracking ---
+    // Call beginTrackStructural before Database() construction, endTrack after.
+    // Call beginTrackIndex before the first warmup query, endTrack after.
     void beginTrackStructural();
-    void endTrackStructural();
+    void beginTrackIndex();
+    void endTrack();
 
-    // Evict ALL cached pages including structural. Next reads fetch from S3.
+    // --- Selective cache eviction ---
+    // Each level preserves pages from higher-priority tiers:
+    //   clearCacheAll:            nuke everything (cold benchmark)
+    //   clearCacheKeepStructural: keep structural, evict index+data (interior benchmark)
+    //   clearCacheKeepIndex:      keep structural+index, evict data (index benchmark)
+    // Warm benchmark: don't clear cache, just close/reopen connection.
     void clearCacheAll();
-
-    // Evict data pages only. Structural pages (read during Database construction)
-    // stay in the local cache and bitmap. Use this for cold benchmarks.
-    void clearCacheDataOnly();
+    void clearCacheKeepStructural();
+    void clearCacheKeepIndex();
 
     // Evict a single page group from the local NVMe cache.
     // Clears bitmap, resets group state, punches hole in cache file (Linux).
