@@ -40,5 +40,6 @@ target_link_libraries(cypher_bench PRIVATE
     -Wl,--end-group
     ${OPENSSL_LIBRARIES}
     ${ZSTD_LIBRARIES}
+    atomic
     dl
     pthread)
