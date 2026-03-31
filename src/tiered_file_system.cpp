@@ -370,7 +370,27 @@ void TieredFileSystem::truncate(common::FileInfo& fileInfo, uint64_t size) const
     }
 }
 
-void TieredFileSystem::clearCache() {
+void TieredFileSystem::beginTrackStructural() {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return;
+    std::lock_guard lock(afi->structuralMu);
+    // Create a fresh structural bitmap.
+    auto bitmapPath = std::filesystem::path(config_.cacheDir) / "structural_bitmap";
+    afi->structuralPages = std::make_unique<PageBitmap>(bitmapPath);
+    if (afi->manifest.pageCount > 0) {
+        afi->structuralPages->resize(afi->manifest.pageCount);
+    }
+    afi->trackingStructural = true;
+}
+
+void TieredFileSystem::endTrackStructural() {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return;
+    std::lock_guard lock(afi->structuralMu);
+    afi->trackingStructural = false;
+}
+
+void TieredFileSystem::clearCacheAll() {
     drainPrefetchAndWait();
     auto* afi = activeFileInfo_.load();
     if (!afi) return;
@@ -382,8 +402,7 @@ void TieredFileSystem::clearCache() {
         afi->bitmap->persist();
     }
 
-    // Reclaim all disk space: truncate to 0, then re-extend.
-    // Simpler than punching holes for every group. Creates sparse file on Linux.
+    // Reclaim all disk space: truncate to 0, then re-extend as sparse.
     if (afi->localFd >= 0) {
         struct stat st;
         if (::fstat(afi->localFd, &st) == 0 && st.st_size > 0) {
@@ -391,6 +410,45 @@ void TieredFileSystem::clearCache() {
             ::ftruncate(afi->localFd, st.st_size);
         }
     }
+}
+
+void TieredFileSystem::clearCacheDataOnly() {
+    drainPrefetchAndWait();
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return;
+
+    afi->resetGroupStates();
+    afi->consecutiveMisses = 0;
+
+    // Rebuild bitmap: keep only structural pages, clear everything else.
+    if (afi->bitmap && afi->structuralPages) {
+        auto pageCount = afi->bitmap->pageCount();
+        afi->bitmap->clear();
+        // Re-mark structural pages as present.
+        for (uint64_t p = 0; p < pageCount; p++) {
+            if (afi->structuralPages->isPresent(p)) {
+                afi->bitmap->markPresent(p);
+            }
+        }
+        afi->bitmap->persist();
+
+        // Re-mark group states for groups that have at least one structural page.
+        for (uint64_t p = 0; p < pageCount; p++) {
+            if (afi->structuralPages->isPresent(p)) {
+                auto gid = p / afi->pagesPerGroup;
+                // Don't mark PRESENT since not all pages in the group may be cached.
+                // Leave as NONE so individual page reads go through the normal path
+                // (bitmap hit -> pread for structural, bitmap miss -> S3 for data).
+            }
+        }
+    } else if (afi->bitmap) {
+        // No structural tracking -- fall back to clearing everything.
+        afi->bitmap->clear();
+        afi->bitmap->persist();
+    }
+
+    // Don't truncate local file -- structural pages are still there.
+    // Data pages will be re-fetched from S3 on next read (bitmap says not present).
 }
 
 void TieredFileSystem::evictLocalGroup(uint64_t pageGroupId) {
@@ -579,6 +637,14 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
 // --- readOnePage: sync fetch + async prefetch ---
 
 std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t pageNum) const {
+    // Track structural pages: any page read while tracking is active is structural.
+    {
+        std::lock_guard lock(ti.structuralMu);
+        if (ti.trackingStructural && ti.structuralPages) {
+            ti.structuralPages->markPresent(pageNum);
+        }
+    }
+
     // 1. Check dirty pages (raw, uncompressed).
     {
         std::lock_guard lock(ti.dirtyMu);

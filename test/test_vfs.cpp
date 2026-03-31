@@ -334,7 +334,7 @@ static void testBitmapStateAfterSync() {
     std::printf("  PASS: testBitmapStateAfterSync\n");
 }
 
-// --- Test: clearCache makes all reads miss the bitmap ---
+// --- Test: clearCacheAll makes all reads miss the bitmap ---
 // After clearCache, reads for pages that were synced to local file should
 // go to S3. Since S3 is fake, they'll return zeros. This tests the bitmap
 // clearing path — the actual S3 cold read is tested in test_vfs_s3.cpp.
@@ -354,7 +354,7 @@ static void testClearCacheInvalidatesBitmap() {
     assert(ti.bitmap->isPresent(0));
 
     // Clear cache (bitmap).
-    vfs.clearCache();
+    vfs.clearCacheAll();
     assert(!ti.bitmap->isPresent(0));
 
     // Read after clear — page is NOT in dirty map, NOT in bitmap.

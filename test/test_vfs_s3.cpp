@@ -88,7 +88,7 @@ static void testColdReadFromS3() {
         }
 
         // Clear cache -> cold read from S3.
-        vfs.clearCache();
+        vfs.clearCacheAll();
         vfs.s3().resetCounters();
 
         for (int i = 0; i < 4; i++) {
@@ -152,7 +152,7 @@ static void testPageGroupPrefetch() {
     }
     fi->syncFile();
 
-    vfs.clearCache();
+    vfs.clearCacheAll();
     assert(!ti.bitmap->isPresent(0));
 
     // Read only page 2 -> should fetch entire page group.
@@ -242,7 +242,7 @@ static void testMultiplePageGroups() {
     }
     fi->syncFile();
 
-    vfs.clearCache();
+    vfs.clearCacheAll();
     vfs.s3().resetCounters();
 
     for (int i = 0; i < 12; i++) {
@@ -277,7 +277,7 @@ static void testS3CounterAccuracy() {
     }
     fi->syncFile();
 
-    vfs.clearCache();
+    vfs.clearCacheAll();
     vfs.s3().resetCounters();
 
     std::vector<uint8_t> buf(PAGE_SIZE, 0);
@@ -314,7 +314,7 @@ static void testOverwriteSyncedPage() {
     fi->syncFile();
 
     // Clear and cold read -> should get 0xBB (from v2 page group).
-    vfs.clearCache();
+    vfs.clearCacheAll();
     std::vector<uint8_t> buf(PAGE_SIZE, 0);
     fi->readFromFile(buf.data(), PAGE_SIZE, 0);
     for (auto b : buf) assert(b == 0xBB);
@@ -656,7 +656,7 @@ static void testEvictWriteSyncColdRead() {
 
 // --- Test: clearCache → write one page → sync → cold read preserves all pages ---
 // Same bug as evict variant, but via clearCache (clears ALL groups at once).
-// This is the exact pattern the benchmark uses: clearCache() then run a query
+// This is the exact pattern the benchmark uses: clearCacheAll() then run a query
 // that touches some pages, causing Kuzu buffer pool to flush dirty pages.
 
 static void testClearCacheWriteSyncColdRead() {
@@ -675,7 +675,7 @@ static void testClearCacheWriteSyncColdRead() {
     fi->syncFile();
 
     // Clear all cached pages.
-    vfs.clearCache();
+    vfs.clearCacheAll();
 
     // Write ONLY page 2. Pages 0, 1, 3 are not in bitmap.
     std::vector<uint8_t> newPage2(PAGE_SIZE, 0xEE);
@@ -932,7 +932,7 @@ static void testFetchThenWriteSyncPreservesData() {
 }
 
 // --- Test: clearCache persists empty bitmap to disk ---
-// Regression: clearCache() must persist the cleared bitmap. Without this,
+// Regression: clearCacheAll() must persist the cleared bitmap. Without this,
 // a subsequent VFS instance loads the stale on-disk bitmap (from the initial
 // checkpoint), sees all pages as present, and reads zeros from the truncated
 // local file — silently corrupting the database.
@@ -963,7 +963,7 @@ static void testClearCachePersistsBitmap() {
         // Bitmap loaded from disk: all 8 pages present.
         for (int i = 0; i < 8; i++) assert(ti.bitmap->isPresent(i));
 
-        vfs.clearCache();
+        vfs.clearCacheAll();
 
         // In-memory bitmap cleared.
         for (int i = 0; i < 8; i++) assert(!ti.bitmap->isPresent(i));
@@ -1024,7 +1024,7 @@ static void testSequentialColdQueriesNoCorruption() {
     for (int iter = 0; iter < 3; iter++) {
         TieredFileSystem vfs(cfg);
         auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
-        vfs.clearCache();
+        vfs.clearCacheAll();
         vfs.s3().resetCounters();
 
         // Read all pages — must come from S3 with correct data.

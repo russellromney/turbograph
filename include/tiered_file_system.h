@@ -75,6 +75,12 @@ struct TieredFileInfo : public common::FileInfo {
 
     mutable uint8_t consecutiveMisses = 0; // For hop-based adaptive prefetch.
 
+    // Structural page tracking: pages read while trackingStructural is true
+    // are marked as structural and preserved by clearCacheDataOnly().
+    mutable std::mutex structuralMu;
+    std::unique_ptr<PageBitmap> structuralPages; // Pages to preserve on data-only clear.
+    bool trackingStructural = false;
+
     // Pending page groups that need background upload.
     mutable std::mutex pendingMu;
     std::unordered_set<uint64_t> pendingPageGroups;
@@ -121,8 +127,18 @@ public:
     // Called by TieredFileInfo destructor before freeing the file info.
     void drainPrefetchAndWait() const;
 
-    // Evict all cached pages. Next reads will fetch from S3.
-    void clearCache();
+    // Start tracking structural pages. Every page read while tracking is
+    // active will be marked as structural (preserved by clearCacheDataOnly).
+    // Call before Database() construction, stop after.
+    void beginTrackStructural();
+    void endTrackStructural();
+
+    // Evict ALL cached pages including structural. Next reads fetch from S3.
+    void clearCacheAll();
+
+    // Evict data pages only. Structural pages (read during Database construction)
+    // stay in the local cache and bitmap. Use this for cold benchmarks.
+    void clearCacheDataOnly();
 
     // Evict a single page group from the local NVMe cache.
     // Clears bitmap, resets group state, punches hole in cache file (Linux).

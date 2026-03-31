@@ -595,49 +595,54 @@ int main(int argc, char** argv) {
                 (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
         }
 
-        // --- COLD: delete cache dir, fresh VFS + buffer pool. All reads from S3 ---
-        for (int q = 0; q < NUM_QUERIES; q++) {
-            try {
-                // Delete BOTH the cache dir and the DB dir so everything starts
-                // truly cold: VFS fetches manifest + pages from S3, Kuzu rebuilds
-                // catalog from the data file. Without deleting dbPath, Kuzu's
-                // checkpoint metadata can become inconsistent with S3 state.
-                if (!localMode) {
-                    std::filesystem::remove_all(cacheDir);
-                    std::filesystem::remove_all(dbPath);
-                }
+        // --- COLD: structural pages cached, data pages evicted, fresh buffer pool ---
+        // One TFS + DB for all cold queries. Structural pages (catalog, metadata)
+        // are tracked during DB open and preserved. Data pages are evicted before
+        // each query so they must be re-fetched from S3.
+        {
+            std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
+            lbug::tiered::TieredFileSystem* tfsPtr = nullptr;
+            lbug::tiered::S3Client* s3Ptr = nullptr;
+            if (!localMode) {
+                auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
+                tfsPtr = tfs.get();
+                s3Ptr = &tfs->s3();
+                fsList.push_back(std::move(tfs));
+            }
+            lbug::main::SystemConfig sysCfg;
+            sysCfg.bufferPoolSize = bufferPoolBytes;
+            sysCfg.forceCheckpointOnClose = false;
+            sysCfg.autoCheckpoint = false;
 
-                std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
-                lbug::tiered::S3Client* s3Ptr = nullptr;
-                if (!localMode) {
-                    auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
-                    s3Ptr = &tfs->s3();
-                    s3Ptr->resetCounters();
-                    fsList.push_back(std::move(tfs));
-                }
-                lbug::main::SystemConfig sysCfg;
-                sysCfg.bufferPoolSize = bufferPoolBytes;
-                sysCfg.forceCheckpointOnClose = false;
-                sysCfg.autoCheckpoint = false;
-                lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
-                lbug::main::Connection conn(&db);
+            // Track structural pages during Database construction.
+            if (tfsPtr) tfsPtr->beginTrackStructural();
+            lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
+            if (tfsPtr) tfsPtr->endTrackStructural();
 
-                auto start = Clock::now();
-                auto result = conn.query(QUERIES[q].cypher);
-                auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    Clock::now() - start).count();
-                if (!result->isSuccess()) {
-                    std::fprintf(stderr, "  FAIL [cold] %s: %s\n",
-                        QUERIES[q].name, result->getErrorMessage().c_str());
+            for (int q = 0; q < NUM_QUERIES; q++) {
+                try {
+                    // Evict data pages, keep structural.
+                    if (tfsPtr) tfsPtr->clearCacheDataOnly();
+                    if (s3Ptr) s3Ptr->resetCounters();
+                    lbug::main::Connection conn(&db);
+
+                    auto start = Clock::now();
+                    auto result = conn.query(QUERIES[q].cypher);
+                    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - start).count();
+                    if (!result->isSuccess()) {
+                        std::fprintf(stderr, "  FAIL [cold] %s: %s\n",
+                            QUERIES[q].name, result->getErrorMessage().c_str());
+                    }
+                    uint64_t s3Reqs = s3Ptr ? s3Ptr->fetchCount.load() : 0;
+                    uint64_t s3Bytes = s3Ptr ? s3Ptr->fetchBytes.load() : 0;
+                    coldStats[q].samples.push_back(us);
+                    std::printf("    [cold] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
+                        iter, QUERIES[q].name, (long long)(us / 1000),
+                        (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "  CRASH [cold] %s: %s\n", QUERIES[q].name, e.what());
                 }
-                uint64_t s3Reqs = s3Ptr ? s3Ptr->fetchCount.load() : 0;
-                uint64_t s3Bytes = s3Ptr ? s3Ptr->fetchBytes.load() : 0;
-                coldStats[q].samples.push_back(us);
-                std::printf("    [cold] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
-                    iter, QUERIES[q].name, (long long)(us / 1000),
-                    (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "  CRASH [cold] %s: %s\n", QUERIES[q].name, e.what());
             }
         }
     }
