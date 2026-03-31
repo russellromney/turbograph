@@ -49,8 +49,14 @@ else()
     include_directories(stubs)
 endif()
 
-# Third-party.
-include_directories(third_party/httplib)
+# cpp-httplib (header-only, fetched at build time).
+include(FetchContent)
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.18.7
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(httplib)
+include_directories(${httplib_SOURCE_DIR})
 include_directories(${OPENSSL_INCLUDE_DIR})
 include_directories(${ZSTD_INCLUDE_DIRS})
 
