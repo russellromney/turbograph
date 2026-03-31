@@ -595,15 +595,19 @@ int main(int argc, char** argv) {
                 (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
         }
 
-        // --- COLD: clear bitmap, fresh buffer pool per query. All reads go to S3 ---
+        // --- COLD: delete cache dir, fresh VFS + buffer pool. All reads from S3 ---
         for (int q = 0; q < NUM_QUERIES; q++) {
             try {
+                // Delete the entire cache dir so the VFS starts truly cold:
+                // no local file, no bitmap, manifest fetched from S3.
+                if (!localMode) {
+                    std::filesystem::remove_all(cacheDir);
+                }
+
                 std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
-                lbug::tiered::TieredFileSystem* tfsPtr = nullptr;
                 lbug::tiered::S3Client* s3Ptr = nullptr;
                 if (!localMode) {
                     auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
-                    tfsPtr = tfs.get();
                     s3Ptr = &tfs->s3();
                     s3Ptr->resetCounters();
                     fsList.push_back(std::move(tfs));
@@ -613,8 +617,6 @@ int main(int argc, char** argv) {
                 sysCfg.forceCheckpointOnClose = false;
                 sysCfg.autoCheckpoint = false;
                 lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
-                // Clear bitmap AFTER db open (which calls openFile and loads bitmap).
-                if (tfsPtr) tfsPtr->clearCache();
                 lbug::main::Connection conn(&db);
 
                 auto start = Clock::now();
