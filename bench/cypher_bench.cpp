@@ -633,11 +633,52 @@ int main(int argc, char** argv) {
         std::printf("  Running benchmark (%d/%d iterations)...\n",
             cfg.coldIterations, cfg.warmIterations);
 
-        // --- Phase 1: COLD (nothing cached) ---
+        // --- Phase 1: COLD (fresh TFS + DB per query, nothing cached) ---
+        // Each cold query creates its own TFS with an empty temp cache dir
+        // and a fresh Database (fresh buffer pool). This is a true cold start:
+        // manifest from S3, no local cache, no buffer pool hits.
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
-            if (tfsPtr) tfsPtr->clearCacheAll();
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, q, iter, "cold", coldStats);
+                try {
+                    auto coldCacheDir = cacheDir + "_cold_" + std::to_string(iter) + "_" + std::to_string(q);
+                    std::filesystem::remove_all(coldCacheDir);
+
+                    lbug::tiered::S3Client* coldS3 = nullptr;
+                    std::vector<std::unique_ptr<lbug::common::FileSystem>> coldFsList;
+                    if (!localMode) {
+                        auto coldCfg = tieredCfg;
+                        coldCfg.cacheDir = coldCacheDir;
+                        auto coldTfs = std::make_unique<lbug::tiered::TieredFileSystem>(coldCfg);
+                        coldS3 = &coldTfs->s3();
+                        coldS3->resetCounters();
+                        coldFsList.push_back(std::move(coldTfs));
+                    }
+                    lbug::main::SystemConfig coldSysCfg;
+                    coldSysCfg.bufferPoolSize = bufferPoolBytes;
+                    coldSysCfg.forceCheckpointOnClose = false;
+                    coldSysCfg.autoCheckpoint = false;
+                    lbug::main::Database coldDb(dbPath, coldSysCfg, std::move(coldFsList));
+                    lbug::main::Connection conn(&coldDb);
+
+                    auto start = Clock::now();
+                    auto result = conn.query(QUERIES[q].cypher);
+                    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - start).count();
+                    if (!result->isSuccess()) {
+                        std::fprintf(stderr, "  FAIL [cold] %s: %s\n",
+                            QUERIES[q].name, result->getErrorMessage().c_str());
+                    }
+                    uint64_t s3Reqs = coldS3 ? coldS3->fetchCount.load() : 0;
+                    uint64_t s3Bytes = coldS3 ? coldS3->fetchBytes.load() : 0;
+                    coldStats[q].samples.push_back(us);
+                    std::printf("    [%-8s] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
+                        "cold", iter, QUERIES[q].name, (long long)(us / 1000),
+                        (unsigned long long)s3Reqs, (unsigned long long)(s3Bytes / 1024));
+
+                    std::filesystem::remove_all(coldCacheDir);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "  CRASH [cold] %s: %s\n", QUERIES[q].name, e.what());
+                }
             }
         }
 
