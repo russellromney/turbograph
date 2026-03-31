@@ -54,6 +54,11 @@ add_executable(test_seekable test_seekable.cpp)
 target_link_libraries(test_seekable PRIVATE turbograph)
 add_test(NAME SeekableTest COMMAND test_seekable)
 
+# Integration test: cold-open scenarios (requires credentials)
+add_executable(test_cold_open test_cold_open.cpp)
+target_link_libraries(test_cold_open PRIVATE turbograph)
+add_test(NAME ColdOpenTest COMMAND test_cold_open)
+
 # Unit test: VFS (no S3 required)
 add_executable(test_vfs test_vfs.cpp)
 target_link_libraries(test_vfs PRIVATE turbograph)

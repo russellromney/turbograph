@@ -745,7 +745,23 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
     bool ok = fetchAndStoreGroup(ti, pageGroupId, &requestedPage, localIdx);
 
     if (ok) {
-        if (!skipGroupTracking) ti.markGroupPresent(pageGroupId);
+        // Only mark PRESENT if we fetched the FULL group (legacy or prefetch path).
+        // Seekable single-frame fetches leave other frames unfetched, so the group
+        // must stay NONE to allow subsequent frame fetches for other pages.
+        bool fetchedFullGroup = true;
+        {
+            std::lock_guard lock(ti.manifestMu);
+            auto subPPF = ti.manifest.subPagesPerFrame;
+            fetchedFullGroup = !(subPPF > 0 &&
+                pageGroupId < ti.manifest.frameTables.size() &&
+                !ti.manifest.frameTables[pageGroupId].empty());
+        }
+        if (!skipGroupTracking && fetchedFullGroup) {
+            ti.markGroupPresent(pageGroupId);
+        } else if (!skipGroupTracking) {
+            // Reset to NONE so other pages in this group can trigger their own frame fetches.
+            ti.markGroupNone(pageGroupId);
+        }
     } else {
         if (!skipGroupTracking) ti.markGroupNone(pageGroupId);
         return std::vector<uint8_t>(ti.pageSize, 0);
