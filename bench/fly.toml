@@ -1,0 +1,17 @@
+app = 'turbograph-bench'
+primary_region = 'iad'
+
+[build]
+  dockerfile = "Dockerfile"
+
+[build.settings]
+  context = "../../"
+
+[mounts]
+  source = "bench_data"
+  destination = "/data"
+
+[[vm]]
+  memory = '64gb'
+  cpu_kind = 'performance'
+  cpus = 8
