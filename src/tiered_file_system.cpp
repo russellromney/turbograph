@@ -142,6 +142,31 @@ TieredFileSystem::TieredFileSystem(TieredConfig config) : config_(std::move(conf
     }
 }
 
+// --- Schedule switching ---
+
+void TieredFileSystem::setActiveSchedule(const std::string& name) {
+    std::lock_guard lock(scheduleMu_);
+    activeScheduleName_ = name;
+    // Reset miss counter so the new schedule starts fresh.
+    auto* afi = activeFileInfo_.load();
+    if (afi) afi->consecutiveMisses = 0;
+}
+
+void TieredFileSystem::setSchedule(const std::string& name, const std::vector<float>& hops) {
+    std::lock_guard lock(scheduleMu_);
+    if (name == "scan") config_.schedules.scan = hops;
+    else if (name == "lookup") config_.schedules.lookup = hops;
+    else if (name == "default") config_.schedules.defaultSchedule = hops;
+}
+
+const std::vector<float>& TieredFileSystem::getActiveHops() const {
+    // No lock needed for reads -- schedule changes are infrequent and
+    // reading a stale schedule for one query is harmless.
+    if (activeScheduleName_ == "scan") return config_.schedules.scan;
+    if (activeScheduleName_ == "lookup") return config_.schedules.lookup;
+    return config_.schedules.defaultSchedule;
+}
+
 TieredFileSystem::~TieredFileSystem() {
     // Stop prefetch pool before flushing.
     drainPrefetchAndWait();
@@ -867,7 +892,7 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
                 (ti.manifest.pageCount + ti.pagesPerGroup - 1) / ti.pagesPerGroup;
         }
 
-        const auto& hops = config_.prefetchHops;
+        const auto& hops = getActiveHops();
         float hopSum = 0;
         for (auto v : hops) hopSum += v;
         bool fractionMode = (hopSum <= 1.01f);

@@ -226,32 +226,37 @@ static void generateCSVData(const std::string& dataDir, const BenchConfig& cfg) 
 struct QueryDef {
     const char* name;
     const char* cypher;
+    const char* schedule; // "scan", "lookup", or "default"
 };
 
 static const QueryDef QUERIES[] = {
     {"Q1: Top 3 most-followed",
      "MATCH (follower:Person)-[:Follows]->(person:Person) "
      "RETURN person.name AS name, count(follower.id) AS numFollowers "
-     "ORDER BY numFollowers DESC LIMIT 3"},
+     "ORDER BY numFollowers DESC LIMIT 3",
+     "scan"},
 
     {"Q2: City of most-followed",
      "MATCH (follower:Person)-[:Follows]->(person:Person) "
      "WITH person, count(follower.id) as numFollowers "
      "ORDER BY numFollowers DESC LIMIT 1 "
      "MATCH (person)-[:LivesIn]->(city:City) "
-     "RETURN person.name AS name, numFollowers, city.city AS city, city.country AS country"},
+     "RETURN person.name AS name, numFollowers, city.city AS city, city.country AS country",
+     "scan"},
 
     {"Q3: Youngest cities US",
      "MATCH (p:Person)-[:LivesIn]->(c:City) "
      "WHERE c.country = 'United States' "
      "RETURN c.city AS city, avg(p.age) AS averageAge "
-     "ORDER BY averageAge LIMIT 5"},
+     "ORDER BY averageAge LIMIT 5",
+     "scan"},
 
     {"Q4: Persons 30-40 by country",
      "MATCH (p:Person)-[:LivesIn]->(c:City) "
      "WHERE p.age >= 30 AND p.age <= 40 "
      "RETURN c.country AS country, count(p) AS personCount "
-     "ORDER BY personCount DESC LIMIT 3"},
+     "ORDER BY personCount DESC LIMIT 3",
+     "scan"},
 
     {"Q5: Male fine diners London",
      "MATCH (p:Person)-[:HasInterest]->(i:Interest) "
@@ -259,7 +264,8 @@ static const QueryDef QUERIES[] = {
      "WITH p "
      "MATCH (p)-[:LivesIn]->(c:City) "
      "WHERE c.city = 'London' AND c.country = 'United Kingdom' "
-     "RETURN count(p) AS numPersons"},
+     "RETURN count(p) AS numPersons",
+     "scan"},
 
     {"Q6: Female tennis by city",
      "MATCH (p:Person)-[:HasInterest]->(i:Interest) "
@@ -267,7 +273,8 @@ static const QueryDef QUERIES[] = {
      "WITH p "
      "MATCH (p)-[:LivesIn]->(c:City) "
      "RETURN count(p.id) AS numPersons, c.city AS city, c.country AS country "
-     "ORDER BY numPersons DESC LIMIT 5"},
+     "ORDER BY numPersons DESC LIMIT 5",
+     "scan"},
 
     {"Q7: US photographers 23-30",
      "MATCH (p:Person)-[:LivesIn]->(c:City) "
@@ -275,16 +282,19 @@ static const QueryDef QUERIES[] = {
      "WITH p "
      "MATCH (p)-[:HasInterest]->(i:Interest) "
      "WHERE lower(i.interest) = 'photography' "
-     "RETURN count(p.id) AS numPersons"},
+     "RETURN count(p.id) AS numPersons",
+     "scan"},
 
     {"Q8: 2-hop path count",
      "MATCH (a:Person)-[:Follows]->(b:Person)-[:Follows]->(c:Person) "
-     "RETURN count(*) AS numPaths"},
+     "RETURN count(*) AS numPaths",
+     "scan"},
 
     {"Q9: Filtered 2-hop paths",
      "MATCH (a:Person)-[:Follows]->(b:Person)-[:Follows]->(c:Person) "
      "WHERE b.age < 50 AND c.age > 25 "
-     "RETURN count(*) AS numPaths"},
+     "RETURN count(*) AS numPaths",
+     "scan"},
 };
 static constexpr int NUM_QUERIES = 9;
 
@@ -392,28 +402,35 @@ int main(int argc, char** argv) {
         tieredCfg.dataFilePath = dbPath;
         tieredCfg.cacheDir = cacheDir;
         tieredCfg.pageSize = 4096;
-        // Parse PREFETCH_HOPS env var: comma-separated floats (e.g. "0.33,0.33").
-        // Default: 0.33,0.33 = 3 hops (33% / 33% / 34%).
-        tieredCfg.prefetchHops = {0.33f, 0.33f};
-        auto hopsEnv = std::getenv("PREFETCH_HOPS");
-        if (hopsEnv) {
-            tieredCfg.prefetchHops.clear();
-            std::string s(hopsEnv);
+        // Prefetch schedules: PREFETCH_SCAN, PREFETCH_LOOKUP env vars
+        // (comma-separated floats). Defaults: scan=0.3,0.3,0.4  lookup=0,0,0
+        auto parseHops = [](const char* env, std::vector<float>& out) {
+            if (!env) return;
+            out.clear();
+            std::string s(env);
             size_t pos = 0;
             while (pos < s.size()) {
                 auto comma = s.find(',', pos);
                 auto token = (comma == std::string::npos) ? s.substr(pos) : s.substr(pos, comma - pos);
-                if (!token.empty()) tieredCfg.prefetchHops.push_back(std::stof(token));
+                if (!token.empty()) out.push_back(std::stof(token));
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
-        }
+        };
+        parseHops(std::getenv("PREFETCH_SCAN"), tieredCfg.schedules.scan);
+        parseHops(std::getenv("PREFETCH_LOOKUP"), tieredCfg.schedules.lookup);
+        parseHops(std::getenv("PREFETCH_DEFAULT"), tieredCfg.schedules.defaultSchedule);
         auto threadsEnv = std::getenv("PREFETCH_THREADS");
         if (threadsEnv) tieredCfg.prefetchThreads = std::atoi(threadsEnv);
         auto subPagesEnv = std::getenv("SUB_PAGES_PER_FRAME");
         if (subPagesEnv) tieredCfg.subPagesPerFrame = std::atoi(subPagesEnv);
-        std::printf("  Prefetch hops:");
-        for (auto h : tieredCfg.prefetchHops) std::printf(" %.2f", h);
+        std::printf("  Schedules: scan=[");
+        for (size_t i = 0; i < tieredCfg.schedules.scan.size(); i++)
+            std::printf("%s%.2f", i ? "," : "", tieredCfg.schedules.scan[i]);
+        std::printf("] lookup=[");
+        for (size_t i = 0; i < tieredCfg.schedules.lookup.size(); i++)
+            std::printf("%s%.2f", i ? "," : "", tieredCfg.schedules.lookup[i]);
+        std::printf("]\n");
         auto resolvedThreads = tieredCfg.prefetchThreads > 0
             ? tieredCfg.prefetchThreads
             : std::max(1u, std::thread::hardware_concurrency() - 1);
@@ -567,9 +584,11 @@ int main(int argc, char** argv) {
     LatencyStats warmStats[NUM_QUERIES];
 
     auto runQuery = [&](lbug::main::Database& db, lbug::tiered::S3Client* s3Ptr,
+        lbug::tiered::TieredFileSystem* tfs,
         int q, int iter, const char* label, LatencyStats* stats) {
         try {
             if (s3Ptr) s3Ptr->resetCounters();
+            if (tfs) tfs->setActiveSchedule(QUERIES[q].schedule);
             lbug::main::Connection conn(&db);
 
             auto start = Clock::now();
@@ -682,7 +701,7 @@ int main(int argc, char** argv) {
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
             if (tfsPtr) tfsPtr->clearCacheKeepStructural();
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, q, iter, "interior", interiorStats);
+                runQuery(db, s3Ptr, tfsPtr, q, iter, "interior", interiorStats);
             }
         }
 
@@ -693,14 +712,14 @@ int main(int argc, char** argv) {
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
             if (tfsPtr) tfsPtr->clearCacheKeepIndex();
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, q, iter, "index", indexStats);
+                runQuery(db, s3Ptr, tfsPtr, q, iter, "index", indexStats);
             }
         }
 
         // --- Phase 4: WARM (everything cached, nuke buffer pool via Connection close) ---
         for (int iter = 0; iter < cfg.warmIterations; iter++) {
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, q, iter, "warm", warmStats);
+                runQuery(db, s3Ptr, tfsPtr, q, iter, "warm", warmStats);
             }
         }
     }

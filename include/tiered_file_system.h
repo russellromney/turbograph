@@ -29,14 +29,21 @@ struct TieredConfig {
     uint32_t pagesPerGroup = 2048;               // Pages per page group (2048 * 4KB = 8MB).
     uint32_t subPagesPerFrame = 4;               // Pages per seekable sub-frame (4 * 4KB = 16KB raw).
 
-    // Prefetch hop schedule. Each entry controls how many page groups to fetch
-    // on that consecutive cache miss. An implicit final hop always fetches
-    // everything remaining — so N entries = N+1 total hops.
-    // Two modes (auto-detected by sum):
+    // Named prefetch schedules. Each entry controls how many page groups to
+    // fetch on that consecutive cache miss. An implicit final hop always
+    // fetches everything remaining. Two modes (auto-detected by sum):
     //   Fraction mode (sum <= 1.0): each value is a fraction of totalPageGroups.
     //   Absolute mode (sum > 1.0):  each value is a page group count.
-    // Default: {0.33, 0.33} = 3 hops — 33% / 33% / 34%.
-    std::vector<float> prefetchHops = {0.33f, 0.33f};
+    //
+    // "scan":   aggressive, for edge traversals and sequential column scans.
+    // "lookup": conservative, for point queries and hash index lookups.
+    //           Three free hops before any prefetch.
+    // "default": used when no schedule is explicitly selected.
+    struct PrefetchSchedules {
+        std::vector<float> scan = {0.3f, 0.3f, 0.4f};
+        std::vector<float> lookup = {0.0f, 0.0f, 0.0f};
+        std::vector<float> defaultSchedule = {0.33f, 0.33f};
+    } schedules;
 
     // Number of background threads for async prefetch.
     uint32_t prefetchThreads = 0; // 0 = auto (num_cpus - 1, min 1).
@@ -121,6 +128,15 @@ public:
         const std::string& path) const override;
 
     bool canHandleFile(const std::string_view path) const override;
+
+    // --- Schedule switching (for UDF / benchmark) ---
+    // Set the active prefetch schedule by name: "scan", "lookup", "default".
+    // Also resets the consecutive miss counter.
+    void setActiveSchedule(const std::string& name);
+    const std::string& getActiveSchedule() const { return activeScheduleName_; }
+
+    // Set a custom schedule by name. Overwrites the named slot.
+    void setSchedule(const std::string& name, const std::vector<float>& hops);
 
     // Expose S3 client for I/O counters (benchmarking).
     S3Client& s3() { return *s3_; }
@@ -227,6 +243,11 @@ private:
     mutable bool existsCached_ = false;
     mutable bool existsResult_ = false;
     mutable std::mutex existsMu_;
+
+    // Active prefetch schedule.
+    std::string activeScheduleName_ = "default";
+    mutable std::mutex scheduleMu_;
+    const std::vector<float>& getActiveHops() const;
 
     // Raw pointer to the active TieredFileInfo, set in openFile().
     // Used by flushPendingPageGroups() and clearCache() to access file state.
