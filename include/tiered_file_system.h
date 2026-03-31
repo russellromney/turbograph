@@ -39,7 +39,7 @@ struct TieredConfig {
     std::vector<float> prefetchHops = {0.33f, 0.33f};
 
     // Number of background threads for async prefetch.
-    uint32_t prefetchThreads = 8;
+    uint32_t prefetchThreads = 0; // 0 = auto (num_cpus - 1, min 1).
 
 };
 

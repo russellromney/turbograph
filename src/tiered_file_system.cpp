@@ -129,6 +129,12 @@ void TieredFileInfo::resetGroupStates() {
 TieredFileSystem::TieredFileSystem(TieredConfig config) : config_(std::move(config)) {
     s3_ = std::make_shared<S3Client>(config_.s3);
 
+    // Resolve auto prefetch threads: num_cpus - 1, min 1.
+    if (config_.prefetchThreads == 0) {
+        auto cpus = std::thread::hardware_concurrency();
+        config_.prefetchThreads = std::max(1u, cpus > 1 ? cpus - 1 : 1u);
+    }
+
     // Start prefetch worker threads.
     prefetchStop_.store(false);
     for (uint32_t i = 0; i < config_.prefetchThreads; i++) {

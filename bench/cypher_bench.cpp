@@ -290,23 +290,17 @@ static constexpr int NUM_QUERIES = 9;
 
 struct LatencyStats {
     std::vector<int64_t> samples;
+    int64_t avg() const {
+        if (samples.empty()) return 0;
+        int64_t sum = 0;
+        for (auto s : samples) sum += s;
+        return sum / static_cast<int64_t>(samples.size());
+    }
     int64_t p50() const {
         if (samples.empty()) return 0;
         auto sorted = samples;
         std::sort(sorted.begin(), sorted.end());
         return sorted[sorted.size() / 2];
-    }
-    int64_t p90() const {
-        if (samples.empty()) return 0;
-        auto sorted = samples;
-        std::sort(sorted.begin(), sorted.end());
-        return sorted[std::min(sorted.size() - 1, (size_t)(sorted.size() * 9 / 10))];
-    }
-    int64_t p99() const {
-        if (samples.empty()) return 0;
-        auto sorted = samples;
-        std::sort(sorted.begin(), sorted.end());
-        return sorted[std::min(sorted.size() - 1, (size_t)(sorted.size() * 99 / 100))];
     }
 };
 
@@ -420,8 +414,11 @@ int main(int argc, char** argv) {
         if (subPagesEnv) tieredCfg.subPagesPerFrame = std::atoi(subPagesEnv);
         std::printf("  Prefetch hops:");
         for (auto h : tieredCfg.prefetchHops) std::printf(" %.2f", h);
+        auto resolvedThreads = tieredCfg.prefetchThreads > 0
+            ? tieredCfg.prefetchThreads
+            : std::max(1u, std::thread::hardware_concurrency() - 1);
         std::printf(" (+ implicit remainder)  threads=%u  sub_pages_per_frame=%u\n",
-            tieredCfg.prefetchThreads, tieredCfg.subPagesPerFrame);
+            resolvedThreads, tieredCfg.subPagesPerFrame);
     }
 
     // Buffer pool size: BUFFER_POOL_MB env var (default: 256MB).
@@ -722,17 +719,17 @@ int main(int argc, char** argv) {
     std::printf("\n");
 
     std::printf("  %-28s %10s %10s %10s %10s %10s\n",
-        "", "Cold p50", "Interior", "Index", "Warm p50", "Neo4j");
+        "", "Cold avg", "Interior", "Index", "Warm avg", "Neo4j");
     std::printf("  %-28s %10s %10s %10s %10s %10s\n",
         "", "--------", "--------", "-----", "--------", "-----");
 
     for (int q = 0; q < NUM_QUERIES; q++) {
         std::printf("  %-28s %10s %10s %10s %10s %10s\n",
             QUERIES[q].name,
-            formatUs(coldStats[q].p50()).c_str(),
-            formatUs(interiorStats[q].p50()).c_str(),
-            formatUs(indexStats[q].p50()).c_str(),
-            formatUs(warmStats[q].p50()).c_str(),
+            formatUs(coldStats[q].avg()).c_str(),
+            formatUs(interiorStats[q].avg()).c_str(),
+            formatUs(indexStats[q].avg()).c_str(),
+            formatUs(warmStats[q].avg()).c_str(),
             formatUs(NEO4J_US[q]).c_str());
     }
     std::printf("\n");
