@@ -169,7 +169,16 @@ void TieredFileSystem::prefetchWorkerLoop() const {
         prefetchInFlight_.fetch_add(1);
 
         auto& ti = *job.ti;
-        if (ti.tryClaimGroup(job.groupId)) {
+        if (job.slingshot) {
+            // Slingshot: group is already FETCHING (claimed by the sync reader).
+            // Fetch the full group and mark PRESENT. Waiters on groupCv will wake.
+            bool ok = fetchAndStoreGroup(ti, job.groupId);
+            if (ok) {
+                ti.markGroupPresent(job.groupId);
+            } else {
+                ti.markGroupNone(job.groupId);
+            }
+        } else if (ti.tryClaimGroup(job.groupId)) {
             bool ok = fetchAndStoreGroup(ti, job.groupId);
             if (ok) {
                 ti.markGroupPresent(job.groupId);
@@ -763,15 +772,25 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
             ti.markGroupPresent(pageGroupId);
         } else if (!skipGroupTracking) {
             // Seekable frame fetch: we got one frame but the group has more.
-            // Submit the full group to the prefetch pool as a background job.
-            // The prefetch worker will fetch the entire S3 object and decode
-            // all frames, populating the local cache for subsequent page reads.
-            // Group stays NONE so the prefetch worker can claim it via tryClaimGroup.
-            ti.markGroupNone(pageGroupId);
+            // Keep group as FETCHING (don't reset to NONE). Submit slingshot
+            // to prefetch pool -- the worker will fetch the full S3 object,
+            // mark PRESENT, and notify waiters. Other page reads in this group
+            // see FETCHING, wait on groupCv, then read from local cache.
+            // Pages from the already-fetched frame hit the bitmap and skip
+            // the group state check entirely.
             {
                 std::lock_guard lock(ti.slingshotMu);
                 if (ti.slingshotSubmitted.insert(pageGroupId).second) {
-                    submitPrefetch(ti, {pageGroupId});
+                    // Submit as slingshot job (skip tryClaimGroup, group is already FETCHING).
+                    std::lock_guard plock(prefetchMu_);
+                    if (!prefetchStop_.load()) {
+                        prefetchQueue_.push_back({&ti, pageGroupId, /*slingshot=*/true});
+                        prefetchCv_.notify_one();
+                    }
+                } else {
+                    // Slingshot already submitted. Leave group as FETCHING so
+                    // other pages wait for the background fetch to complete.
+                    // Don't reset to NONE (which would cause more frame fetches).
                 }
             }
         }

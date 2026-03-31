@@ -9,18 +9,17 @@ sequential seekable frame range GETs. Most queries sub-330ms cold.
 
 ---
 
-## Phase Slingshot: Seekable Frame + Full Group Background Fetch
+## Phase Slingshot: Seekable Frame + Full Group Background Fetch -- DONE
 > After: Phase Baseline · Before: Phase Beacon
 
-The highest-impact single change. When a seekable frame miss triggers a range GET
-for one frame, also submit the entire page group to the prefetch pool as a background
-job. The sync read returns the requested page immediately (~16KB range GET, ~25ms).
-By the time the query reads the next page in that group, the background worker has
-fetched the full group (~12MB, one GET) and all pages are cached.
+First frame miss does a range GET for one ~16KB frame (returns immediately), then
+submits the entire page group to the prefetch pool. Group stays FETCHING so other
+pages in the group wait for the background worker instead of issuing redundant frame
+GETs. Background worker fetches the full ~12MB S3 object, decodes all frames, marks
+PRESENT. Pages from the first frame hit the bitmap and skip the wait.
 
-This eliminates the serial 40-fetch penalty on Q5/Q6/Q7 without any Kuzu integration.
-The seekable frame path gives low latency for the first page; the background full-group
-fetch gives low latency for subsequent pages.
+Results: Q5/Q6/Q7 cold dropped from 1.3s to 44-154ms (up to 30x faster).
+S3 fetches per cold query: 40 -> 7-8.
 
 ### a. Background group fetch after frame miss
 - [ ] In `readOnePage`, after `fetchAndStoreFrame` returns, submit the page group ID
@@ -176,6 +175,14 @@ patterns.
 - Structural pages (catalog, PIP, CSR headers): never evicted
 - Edge adjacency data: evicted only under pressure
 - Property columns: evicted first
+
+### Per-frame state tracking
+- Replace group-level FETCHING/PRESENT/NONE with frame-level states
+- Each frame in a group gets its own atomic state (NONE/FETCHING/PRESENT)
+- Frame fetch marks that frame PRESENT; other frames stay NONE
+- Eliminates the need for slingshot's "keep group FETCHING" workaround
+- Enables fine-grained prefetch: fetch specific frames, not all-or-nothing
+- frameStates array: `totalGroups * framesPerGroup` entries
 
 ### Runtime schedule tuning
 - `turbograph_config_set('prefetch_edge', '0.4,0.3,0.3')` via Cypher

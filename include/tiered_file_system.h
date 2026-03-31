@@ -206,7 +206,11 @@ private:
         uint32_t requestedLocalIdx = 0) const;
 
     // Background prefetch pool.
-    struct PrefetchJob { TieredFileInfo* ti; uint64_t groupId; };
+    struct PrefetchJob {
+        TieredFileInfo* ti;
+        uint64_t groupId;
+        bool slingshot = false; // If true, group is already FETCHING; skip tryClaimGroup.
+    };
     void prefetchWorkerLoop() const;
     void submitPrefetch(TieredFileInfo& ti, const std::vector<uint64_t>& groupIds) const;
     void drainPrefetch() const;
