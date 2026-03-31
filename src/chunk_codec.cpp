@@ -119,6 +119,7 @@ SeekableEncodeResult encodeSeekable(
         FrameEntry entry;
         entry.offset = result.blob.size();
         entry.len = static_cast<uint32_t>(compressed.size());
+        entry.pageCount = pagesInFrame;
         result.frameTable.push_back(entry);
 
         result.blob.insert(result.blob.end(), compressed.begin(), compressed.end());
@@ -129,7 +130,15 @@ SeekableEncodeResult encodeSeekable(
 
 std::vector<uint8_t> decodeFrame(const std::vector<uint8_t>& frameData,
     uint32_t pagesInFrame, uint32_t pageSize) {
-    auto decompressedSize = static_cast<size_t>(pagesInFrame) * pageSize;
+    // Use zstd's content size when available (more reliable than caller's estimate).
+    auto contentSize = ZSTD_getFrameContentSize(frameData.data(), frameData.size());
+    size_t decompressedSize;
+    if (contentSize != ZSTD_CONTENTSIZE_UNKNOWN && contentSize != ZSTD_CONTENTSIZE_ERROR) {
+        decompressedSize = contentSize;
+    } else {
+        decompressedSize = static_cast<size_t>(pagesInFrame) * pageSize;
+    }
+
     std::vector<uint8_t> raw(decompressedSize);
     auto actualSize = ZSTD_decompress(raw.data(), decompressedSize,
         frameData.data(), frameData.size());

@@ -416,10 +416,12 @@ int main(int argc, char** argv) {
         }
         auto threadsEnv = std::getenv("PREFETCH_THREADS");
         if (threadsEnv) tieredCfg.prefetchThreads = std::atoi(threadsEnv);
+        auto subPagesEnv = std::getenv("SUB_PAGES_PER_FRAME");
+        if (subPagesEnv) tieredCfg.subPagesPerFrame = std::atoi(subPagesEnv);
         std::printf("  Prefetch hops:");
         for (auto h : tieredCfg.prefetchHops) std::printf(" %.2f", h);
-        std::printf(" (+ implicit remainder)  threads=%u\n",
-            tieredCfg.prefetchThreads);
+        std::printf(" (+ implicit remainder)  threads=%u  sub_pages_per_frame=%u\n",
+            tieredCfg.prefetchThreads, tieredCfg.subPagesPerFrame);
     }
 
     // Buffer pool size: BUFFER_POOL_MB env var (default: 256MB).

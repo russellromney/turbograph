@@ -39,6 +39,8 @@ std::string Manifest::toJSON() const {
                 json += std::to_string(frameTables[g][f].offset);
                 json += ',';
                 json += std::to_string(frameTables[g][f].len);
+                json += ',';
+                json += std::to_string(frameTables[g][f].pageCount);
                 json += ']';
             }
             json += ']';
@@ -135,18 +137,24 @@ static std::optional<std::vector<std::vector<FrameEntry>>> parseFrameTables(
             if (json[outerPos] != '[') return std::nullopt;
             outerPos++; // skip entry '['
 
-            // Parse [offset, len].
+            // Parse [offset, len, pageCount].
             FrameEntry entry;
             char* end = nullptr;
             entry.offset = std::strtoull(json.c_str() + outerPos, &end, 10);
             outerPos = end - json.c_str();
-            // Skip comma.
             while (outerPos < json.size() && (json[outerPos] == ',' || json[outerPos] == ' ')) {
                 outerPos++;
             }
             entry.len = static_cast<uint32_t>(std::strtoul(json.c_str() + outerPos, &end, 10));
             outerPos = end - json.c_str();
-            // Skip to closing ']'.
+            // pageCount is optional (backward compat with old 2-element entries).
+            while (outerPos < json.size() && (json[outerPos] == ',' || json[outerPos] == ' ')) {
+                outerPos++;
+            }
+            if (outerPos < json.size() && json[outerPos] != ']') {
+                entry.pageCount = static_cast<uint32_t>(std::strtoul(json.c_str() + outerPos, &end, 10));
+                outerPos = end - json.c_str();
+            }
             while (outerPos < json.size() && json[outerPos] != ']') outerPos++;
             if (outerPos < json.size()) outerPos++; // skip ']'
 

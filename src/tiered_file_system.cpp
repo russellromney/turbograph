@@ -434,22 +434,18 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
     if (pgKey.empty() || frameIdx >= frameTable.size() || subPPF == 0) return false;
 
     auto& entry = frameTable[frameIdx];
+    if (entry.len == 0) return false;
+
     auto compressedFrame = ti.s3->getObjectRange(pgKey, entry.offset, entry.len);
     if (!compressedFrame.has_value()) return false;
 
-    // Compute how many pages are in this frame.
+    // Validate we got the expected number of bytes.
+    if (compressedFrame->size() != entry.len) return false;
+
+    // Use the page count stored at encode time (authoritative for partial frames).
     auto groupStartPage = pageGroupId * ti.pagesPerGroup;
     auto frameStartLocal = frameIdx * subPPF;
-    uint32_t pagesInFrame = subPPF;
-    {
-        std::lock_guard lock(ti.manifestMu);
-        auto totalPagesInGroup = std::min(
-            static_cast<uint64_t>(ti.pagesPerGroup),
-            ti.manifest.pageCount - groupStartPage);
-        if (frameStartLocal + pagesInFrame > totalPagesInGroup) {
-            pagesInFrame = static_cast<uint32_t>(totalPagesInGroup - frameStartLocal);
-        }
-    }
+    uint32_t pagesInFrame = entry.pageCount > 0 ? entry.pageCount : subPPF;
 
     auto rawFrame = decodeFrame(*compressedFrame, pagesInFrame, ti.pageSize);
 
@@ -494,12 +490,12 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
         // Seekable path: fetch only the frame containing the requested page.
         // Prefetch workers call this with requestedLocalIdx=0 and no output,
         // so they fetch all frames via the full-object fallback below.
-        if (requestedPageOut != nullptr) {
+        if (requestedPageOut != nullptr && requestedLocalIdx < ti.pagesPerGroup) {
             auto frameIdx = requestedLocalIdx / subPPF;
             return fetchAndStoreFrame(ti, pageGroupId, frameIdx,
                 requestedPageOut, requestedLocalIdx);
         }
-        // Prefetch path: fetch full object and decode all frames.
+        // Prefetch path (or out-of-bounds): fetch full object and decode all frames.
     }
 
     // Legacy or prefetch path: full object GET.
@@ -524,21 +520,14 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
 
         for (uint32_t f = 0; f < frameTable.size(); f++) {
             auto& entry = frameTable[f];
+            if (entry.len == 0) continue;
             if (entry.offset + entry.len > blob->size()) break;
 
             auto frameStartLocal = f * subPPF;
             auto groupStartPage = pageGroupId * ti.pagesPerGroup;
 
-            uint32_t pagesInFrame = subPPF;
-            {
-                std::lock_guard lock(ti.manifestMu);
-                auto totalPagesInGroup = std::min(
-                    static_cast<uint64_t>(ti.pagesPerGroup),
-                    ti.manifest.pageCount - groupStartPage);
-                if (frameStartLocal + pagesInFrame > totalPagesInGroup) {
-                    pagesInFrame = static_cast<uint32_t>(totalPagesInGroup - frameStartLocal);
-                }
-            }
+            // Use page count from frame entry (authoritative for partial frames).
+            uint32_t pagesInFrame = entry.pageCount > 0 ? entry.pageCount : subPPF;
 
             std::vector<uint8_t> frameData(
                 blob->begin() + entry.offset,
@@ -965,10 +954,12 @@ void TieredFileSystem::flushPendingPageGroups() const {
                         }
                         for (uint32_t f = 0; f < oldFrameTable.size(); f++) {
                             auto& entry = oldFrameTable[f];
+                            if (entry.len == 0) continue;
                             if (entry.offset + entry.len > oldBlob->size()) break;
                             auto frameStartLocal = f * oldSubPPF;
-                            auto pagesInFrame = std::min(oldSubPPF,
-                                ti.pagesPerGroup - frameStartLocal);
+                            auto pagesInFrame = entry.pageCount > 0
+                                ? entry.pageCount
+                                : std::min(oldSubPPF, ti.pagesPerGroup - frameStartLocal);
                             std::vector<uint8_t> frameData(
                                 oldBlob->begin() + entry.offset,
                                 oldBlob->begin() + entry.offset + entry.len);

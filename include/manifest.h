@@ -10,8 +10,9 @@ namespace tiered {
 
 // Byte range within an S3 object for one seekable frame.
 struct FrameEntry {
-    uint64_t offset = 0;  // Byte offset from start of S3 object.
-    uint32_t len = 0;     // Compressed frame length in bytes.
+    uint64_t offset = 0;      // Byte offset from start of S3 object.
+    uint32_t len = 0;         // Compressed frame length in bytes.
+    uint32_t pageCount = 0;   // Actual number of pages encoded in this frame.
 };
 
 struct Manifest {
