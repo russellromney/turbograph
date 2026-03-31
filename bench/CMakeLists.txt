@@ -13,20 +13,27 @@ endif()
 
 add_executable(cypher_bench cypher_bench.cpp)
 
-# Find liblbug in the LadybugDB build tree.
-find_library(LBUG_LIBRARY NAMES lbug
-    HINTS ${LADYBUG_DIR}/build/release/src
-          ${LADYBUG_DIR}/build/src
-          ${LADYBUG_DIR}/build)
+# Find all static libraries from the LadybugDB build tree.
+# liblbug.a depends on parquet, antlr4, utf8proc, etc. -- all built as .a files.
+file(GLOB_RECURSE LBUG_LIBS
+    "${LADYBUG_DIR}/build/release/src/*.a"
+    "${LADYBUG_DIR}/build/release/third_party/*.a")
 
-if(NOT LBUG_LIBRARY)
-    message(FATAL_ERROR "liblbug not found in ${LADYBUG_DIR}/build/. Build LadybugDB first.")
+if(NOT LBUG_LIBS)
+    # Try non-release build dir.
+    file(GLOB_RECURSE LBUG_LIBS
+        "${LADYBUG_DIR}/build/src/*.a"
+        "${LADYBUG_DIR}/build/third_party/*.a")
 endif()
 
-# Link against the full LadybugDB library for Database/Connection APIs.
+if(NOT LBUG_LIBS)
+    message(FATAL_ERROR "No .a files found in ${LADYBUG_DIR}/build/. Build LadybugDB first.")
+endif()
+
+# Link against the full LadybugDB library + all its dependencies.
 target_link_libraries(cypher_bench PRIVATE
     turbograph
-    ${LBUG_LIBRARY}
+    ${LBUG_LIBS}
     ${OPENSSL_LIBRARIES}
     ${ZSTD_LIBRARIES}
     dl
