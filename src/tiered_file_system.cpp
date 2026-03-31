@@ -426,6 +426,7 @@ void TieredFileSystem::clearCacheAll() {
 
     afi->resetGroupStates();
     afi->consecutiveMisses = 0;
+    { std::lock_guard lock(afi->slingshotMu); afi->slingshotSubmitted.clear(); }
     if (afi->bitmap) {
         afi->bitmap->clear();
         afi->bitmap->persist();
@@ -448,6 +449,7 @@ void TieredFileSystem::clearCacheKeepStructural() {
 
     afi->resetGroupStates();
     afi->consecutiveMisses = 0;
+    { std::lock_guard lock(afi->slingshotMu); afi->slingshotSubmitted.clear(); }
 
     if (afi->bitmap && afi->structuralPages) {
         rebuildBitmap(*afi->bitmap, afi->structuralPages.get(), nullptr);
@@ -464,6 +466,7 @@ void TieredFileSystem::clearCacheKeepIndex() {
 
     afi->resetGroupStates();
     afi->consecutiveMisses = 0;
+    { std::lock_guard lock(afi->slingshotMu); afi->slingshotSubmitted.clear(); }
 
     if (afi->bitmap) {
         rebuildBitmap(*afi->bitmap,
@@ -759,8 +762,18 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
         if (!skipGroupTracking && fetchedFullGroup) {
             ti.markGroupPresent(pageGroupId);
         } else if (!skipGroupTracking) {
-            // Reset to NONE so other pages in this group can trigger their own frame fetches.
+            // Seekable frame fetch: we got one frame but the group has more.
+            // Submit the full group to the prefetch pool as a background job.
+            // The prefetch worker will fetch the entire S3 object and decode
+            // all frames, populating the local cache for subsequent page reads.
+            // Group stays NONE so the prefetch worker can claim it via tryClaimGroup.
             ti.markGroupNone(pageGroupId);
+            {
+                std::lock_guard lock(ti.slingshotMu);
+                if (ti.slingshotSubmitted.insert(pageGroupId).second) {
+                    submitPrefetch(ti, {pageGroupId});
+                }
+            }
         }
     } else {
         if (!skipGroupTracking) ti.markGroupNone(pageGroupId);

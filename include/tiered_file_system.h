@@ -88,6 +88,10 @@ struct TieredFileInfo : public common::FileInfo {
     mutable std::mutex pendingMu;
     std::unordered_set<uint64_t> pendingPageGroups;
 
+    // Groups already submitted to prefetch pool (dedup for slingshot).
+    mutable std::mutex slingshotMu;
+    std::unordered_set<uint64_t> slingshotSubmitted;
+
     // Per-page-group fetch state: NONE → FETCHING → PRESENT.
     // Used to coordinate sync fetch with async prefetch.
     uint64_t totalGroups = 0;
