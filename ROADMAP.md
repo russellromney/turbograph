@@ -1,195 +1,114 @@
 # turbograph Roadmap
 
-## Phase Baseline: Tigris Benchmark -- DONE
-> Before: Phase Slingshot
+Completed work is in CHANGELOG.md.
 
-4-level benchmark (cold/interior/index/warm) against Tigris with 100K persons.
-Results in README.md. Key finding: Q5/Q6/Q7 cold penalty (~1.3s) is from 40
-sequential seekable frame range GETs. Most queries sub-330ms cold.
+## Phase Extension: LadybugDB Extension Integration
+> Before: Phase Volley (catalog)
 
----
+Build turbograph as a proper LadybugDB extension. This unlocks UDFs, catalog
+access, and query plan hooks that the VFS can't do standalone.
 
-## Phase Slingshot: Seekable Frame + Full Group Background Fetch -- DONE
-> After: Phase Baseline · Before: Phase Beacon
+### a. Extension wrapper
+- [ ] Create `extension/turbograph/` in ladybug-fork
+- [ ] Register TieredFileSystem via LadybugDB's VirtualFileSystem
+- [ ] Link turbograph static library + liblbug
 
-First frame miss does a range GET for one ~16KB frame (returns immediately), then
-submits the entire page group to the prefetch pool. Group stays FETCHING so other
-pages in the group wait for the background worker instead of issuing redundant frame
-GETs. Background worker fetches the full ~12MB S3 object, decodes all frames, marks
-PRESENT. Pages from the first frame hit the bitmap and skip the wait.
+### b. turbograph_config_set UDF
+- [ ] Register scalar function: `CALL turbograph_config_set(key, value)`
+- [ ] Keys: `prefetch` (set active schedule), `prefetch_scan`, `prefetch_lookup`
+- [ ] UDF holds pointer to TieredFileSystem, calls setActiveSchedule/setSchedule
+- [ ] Per-connection: each Connection gets its own schedule state
 
-Results: Q5/Q6/Q7 cold dropped from 1.3s to 44-154ms (up to 30x faster).
-S3 fetches per cold query: 40 -> 7-8.
-
-### a. Background group fetch after frame miss
-- [ ] In `readOnePage`, after `fetchAndStoreFrame` returns, submit the page group ID
-      to the prefetch pool (which fetches full groups via `fetchAndStoreGroup`)
-- [ ] The group state stays NONE (not PRESENT) so individual page reads still check
-      bitmap first, falling back to S3 only if the background fetch hasn't finished
-- [ ] Prefetch workers use the full-group decode path (all frames), not per-frame
-
-### b. Dedup: don't re-submit groups already in prefetch queue
-- [ ] Track which groups have been submitted to avoid duplicate background fetches
-- [ ] Use a `submittedGroups` set on TieredFileInfo, checked before submitPrefetch
-
-### c. Measure impact
-- [ ] Re-run 4-level benchmark
-- [ ] Expected: Q5/Q6/Q7 cold drops from ~1.3s to ~300-500ms (one full-group GET
-      instead of 40 frame GETs)
-- [ ] Track: S3 fetch count should drop from 40 to ~3-5 per query
+### c. turbograph_info UDF
+- [ ] `CALL turbograph_info()` returns current config, cache stats, S3 fetch count
+- [ ] Useful for debugging and benchmarking
 
 ---
 
-## Phase Beacon: Structural Page Pinning
-> After: Phase Slingshot · Before: Phase Volley
+## Phase Volley (catalog): Per-Table Prefetch Schedules
+> After: Phase Extension · Before: Phase Cypher
 
-Eager-fetch structural pages (page 0, catalog, metadata) during `openFile()` so
-they're available before the first Cypher query runs. Currently these are fetched
-on-demand during `Database()` construction, adding latency to cold open.
+With extension access to the catalog, parse table metadata to build a
+page-to-table mapping. Select prefetch schedule automatically based on
+which table a page belongs to.
 
-### a. Identify structural page ranges
-- [ ] Read page 0 from S3 during `openFile()` to extract `catalogPageRange` and
-      `metadataPageRange` from the DatabaseHeader
-- [ ] Parse the Kuzu serialization format (magic bytes, storage version, then
-      two PageRange structs: startPageIdx + numPages each as uint32_t)
-- [ ] Store ranges on TieredFileInfo as pinned page sets
-
-### b. Parallel eager fetch
-- [ ] Compute which page groups contain structural pages
-- [ ] Fetch those groups in parallel via prefetch pool during `openFile()`
-- [ ] Block `openFile()` return until all structural groups are cached
-- [ ] Mark structural pages in bitmap with a "never evict" flag
-
-### c. Measure impact
-- [ ] Expected: cold open latency for `Database()` construction drops by ~50-100ms
-- [ ] Structural pages are ~1-2 page groups for a 25MB DB
-
----
-
-## Phase Volley: Per-Table Prefetch Schedules
-> After: Phase Beacon · Before: Phase Cypher
-
-turbolite tracks miss counters per B-tree and uses different schedules for SEARCH
-vs lookup. turbograph needs the same, adapted for graph:
-
-- **Edge traversal schedule** (aggressive): for CSR scans where the query walks
-  adjacency lists. Similar to turbolite's SEARCH schedule. On a miss in a
-  relationship table's page range, ramp prefetch hard: `[0.3, 0.3, 0.4]`.
-- **Node lookup schedule** (conservative): for hash index lookups on node primary
-  keys. Similar to turbolite's lookup schedule. Point queries rarely benefit from
-  prefetch: `[0.0, 0.0, 0.0]` (three free hops).
-- **Property scan schedule** (moderate): for scanning node/rel properties in
-  column chunks. Moderate prefetch: `[0.2, 0.3, 0.5]`.
-
-### a. Page-to-table mapping
-- [ ] During `openFile()` structural page parse (Phase Beacon), extract the
-      per-table PageRange metadata from the metadataPageRange
-- [ ] Build a `page -> table_id` lookup (sorted interval map, binary search)
-- [ ] Store on TieredFileInfo alongside the manifest
+### a. Catalog parse for page-to-table mapping
+- [ ] During `openFile()`, use Kuzu's Deserializer to parse metadata pages
+- [ ] Extract per-table column PageRanges (node groups, CSR columns, indexes)
+- [ ] Build sorted interval map: page number -> (table_id, table_type)
+- [ ] Store on TieredFileInfo alongside manifest
 
 ### b. Per-table miss counters
 - [ ] Replace global `consecutiveMisses` with `HashMap<table_id, uint8_t>`
-- [ ] On cache miss, look up the page's table, increment that table's counter
-- [ ] Reset counter for a table when that table has a cache hit
-- [ ] Select schedule based on table type (relationship = edge, node = lookup)
+- [ ] On cache miss, look up page's table, increment that table's counter
+- [ ] Reset counter on cache hit for that table
+- [ ] Auto-select schedule: relationship tables -> scan, node tables -> lookup
 
-### c. Schedule selection
-- [ ] Relationship tables (CSR): edge traversal schedule
-- [ ] Node tables with hash index access: node lookup schedule
-- [ ] Property-only access (column scans): property scan schedule
-- [ ] Configurable via env vars: `PREFETCH_EDGE`, `PREFETCH_LOOKUP`, `PREFETCH_SCAN`
-
-### d. Measure impact
-- [ ] Expected: multi-table join queries (Q5/Q6/Q7) no longer over-prefetch
-      from node lookups escalating the global counter
-- [ ] Expected: point queries (Q4) stay fast with conservative schedule
+### c. Measure impact
+- [ ] Run with 1M persons (~250MB, multiple page groups per table)
+- [ ] Expected: multi-table joins no longer over-prefetch from cross-table miss escalation
 
 ---
 
 ## Phase Cypher: Query Plan Frontrunning
 > After: Phase Volley · Before: Phase Column
 
-Parse Kuzu's query plan before execution to prefetch tables proactively. This is
-turbolite's most impactful optimization: knowing which tables a query touches
-before the first page read eliminates reactive prefetch latency entirely.
+Parse Kuzu's query plan before execution to prefetch tables proactively.
 
-### a. Kuzu EXPLAIN integration
+### a. EXPLAIN integration
 - [ ] Before executing a query, run `EXPLAIN` on the Cypher statement
-- [ ] Parse the physical plan output for operator types:
-      - `SCAN` (full table access) -> bulk prefetch all groups
-      - `INDEX_LOOKUP` (hash index) -> prefetch index pages only
-      - `HASH_JOIN` -> prefetch both sides
-      - `RECURSIVE_JOIN` / `EXTEND` -> prefetch relationship table
-- [ ] Map operator table references to page group ranges via manifest metadata
+- [ ] Parse physical plan for operator types: SCAN, INDEX_LOOKUP, HASH_JOIN, EXTEND
+- [ ] Map operators to table page group ranges via catalog metadata
 
 ### b. Proactive dispatch
-- [ ] For SCAN operators: submit ALL page groups for that table to prefetch pool
-      before the query engine reads the first page
-- [ ] For INDEX_LOOKUP: prefetch hash index page groups only (conservative)
-- [ ] For multi-table joins: submit all tables' groups in parallel
-- [ ] Implementation: hook into Kuzu's `Connection::query()` or provide a
-      `prepareAndPrefetch(cypher)` API
+- [ ] SCAN: submit ALL page groups for that table before first page read
+- [ ] INDEX_LOOKUP: prefetch index page groups only
+- [ ] Multi-table joins: submit all tables' groups in parallel
+- [ ] Hook into Connection::query() or provide prepareAndPrefetch() API
 
-### c. Fallback to reactive
-- [ ] If EXPLAIN fails or returns unexpected output, fall back to per-table
-      reactive schedules (Phase Volley)
-- [ ] If a query accesses pages not predicted by the plan, reactive prefetch
-      handles them normally
-
-### d. Measure impact
-- [ ] Expected: multi-table cold queries drop to near-warm latency because all
-      table groups are prefetched in parallel before the first page read
-- [ ] Expected: Q5/Q6/Q7 cold should approach ~100-200ms (parallel group
-      fetches for HasInterest + LivesIn + Person)
+### c. Fallback
+- [ ] If EXPLAIN fails, fall back to per-table reactive schedules (Phase Volley)
 
 ---
 
 ## Phase Column: Structure-Aware Page Grouping
 > After: Phase Cypher · Before: (future)
 
-Only pursue if benchmarks show page group misses are the bottleneck (not query
-execution time). Re-organize how pages are grouped in S3 to match graph access
-patterns.
+Only pursue if benchmarks show page group misses are the bottleneck.
 
 ### a. Column-aware grouping
-- [ ] Co-locate CSR offset/length pages with edge data pages in same group
-- [ ] Group column chunks within the same node group together
-- [ ] One edge traversal step = one S3 GET (CSR header + edge data)
+- [ ] Co-locate CSR offset/length pages with edge data in same group
+- [ ] Group column chunks within same node group together
+- [ ] One edge traversal step = one S3 GET
 
 ### b. Neighborhood-aware prefetch
-- [ ] When traversing edges, destination node IDs are known from CSR data
-- [ ] Prefetch page groups containing destination nodes before query engine asks
-- [ ] Unique to graphs: the data itself tells you where to go next
+- [ ] Parse destination node IDs from CSR data on fetch completion
+- [ ] Prefetch page groups containing destination nodes before query asks
 
 ### c. Column-selective fetch
-- [ ] Kuzu is columnar: query accessing only `name` and `age` shouldn't fetch
-      all 20 columns
 - [ ] Organize page groups per-column for selective range GETs
-- [ ] Requires manifest metadata mapping columns to page groups
 
 ---
 
 ## Future
+
+### Per-frame state tracking
+- Replace group-level FETCHING/PRESENT/NONE with frame-level states
+- Each frame gets its own atomic state
+- Eliminates slingshot's "keep group FETCHING" workaround
+- frameStates array: totalGroups * framesPerGroup entries
 
 ### Tiered eviction priorities
 - Structural pages (catalog, PIP, CSR headers): never evicted
 - Edge adjacency data: evicted only under pressure
 - Property columns: evicted first
 
-### Per-frame state tracking
-- Replace group-level FETCHING/PRESENT/NONE with frame-level states
-- Each frame in a group gets its own atomic state (NONE/FETCHING/PRESENT)
-- Frame fetch marks that frame PRESENT; other frames stay NONE
-- Eliminates the need for slingshot's "keep group FETCHING" workaround
-- Enables fine-grained prefetch: fetch specific frames, not all-or-nothing
-- frameStates array: `totalGroups * framesPerGroup` entries
-
-### Runtime schedule tuning
-- `turbograph_config_set('prefetch_edge', '0.4,0.3,0.3')` via Cypher
-- Per-connection schedule overrides without VFS restart
-- `turbograph-tune` CLI tool: sweep schedule grid against real queries
+### turbograph-tune CLI
+- Sweep schedule grid against real queries
+- Output per-query comparison table with p50, GET count, bytes
+- Recommend optimal schedule pair
 
 ### Larger benchmarks
-- 1M persons (~250MB DB, multiple page groups)
-- 10M persons (~2.5GB DB, S3 bandwidth becomes the bottleneck)
+- 1M persons (~250MB DB, multiple page groups per table)
+- 10M persons (~2.5GB DB, S3 bandwidth becomes bottleneck)
 - Compare against Neo4j Aura, Amazon Neptune
