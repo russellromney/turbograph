@@ -642,6 +642,10 @@ int main(int argc, char** argv) {
                 try {
                     auto coldCacheDir = cacheDir + "_cold_" + std::to_string(iter) + "_" + std::to_string(q);
                     std::filesystem::remove_all(coldCacheDir);
+                    // Delete WAL and shadow files so the cold Database doesn't
+                    // try to replay stale WAL entries against fresh S3 data.
+                    std::filesystem::remove(dbPath + ".wal");
+                    std::filesystem::remove(dbPath + ".tmp");
 
                     lbug::tiered::S3Client* coldS3 = nullptr;
                     std::vector<std::unique_ptr<lbug::common::FileSystem>> coldFsList;
