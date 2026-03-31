@@ -313,6 +313,55 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
     }
 
     activeFileInfo_.store(info.get());
+
+    // --- Phase Beacon: Eager-fetch structural pages ---
+    // Fetch page 0 to check for Kuzu magic bytes. If valid, parse the database
+    // header to discover catalog + metadata page ranges, then fetch all page
+    // groups containing structural pages. This makes Database() construction
+    // fast because structural pages are already in local cache.
+    if (manifestFound && m.pageCount > 0) {
+        // Fetch page 0 via a single readOnePage call (triggers frame/group fetch).
+        auto page0 = readOnePage(*info, 0);
+
+        // Parse header only if magic bytes match (skip for non-Kuzu data files).
+        if (page0.size() >= 28 &&
+            page0[0] == 'L' && page0[1] == 'B' && page0[2] == 'U' && page0[3] == 'G') {
+            uint32_t catStart, catPages, metaStart, metaPages;
+            std::memcpy(&catStart, page0.data() + 12, 4);
+            std::memcpy(&catPages, page0.data() + 16, 4);
+            std::memcpy(&metaStart, page0.data() + 20, 4);
+            std::memcpy(&metaPages, page0.data() + 24, 4);
+
+            // Collect page groups that contain structural pages.
+            std::unordered_set<uint64_t> structGroups;
+            structGroups.insert(0); // Page 0 group.
+
+            auto addRange = [&](uint32_t start, uint32_t count) {
+                if (start == UINT32_MAX || count == 0) return;
+                for (uint32_t p = start; p < start + count; p++) {
+                    structGroups.insert(p / m.pagesPerGroup);
+                }
+            };
+            addRange(catStart, catPages);
+            addRange(metaStart, metaPages);
+
+            // Fetch remaining structural groups in parallel.
+            std::vector<uint64_t> toFetch;
+            for (auto gid : structGroups) {
+                if (gid < info->totalGroups &&
+                    info->getGroupState(gid) == GroupState::NONE) {
+                    toFetch.push_back(gid);
+                }
+            }
+            if (!toFetch.empty()) {
+                submitPrefetch(*info, toFetch);
+                for (auto gid : toFetch) {
+                    info->waitForGroup(gid);
+                }
+            }
+        }
+    }
+
     return info;
 }
 
