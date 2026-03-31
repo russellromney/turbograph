@@ -598,10 +598,13 @@ int main(int argc, char** argv) {
         // --- COLD: delete cache dir, fresh VFS + buffer pool. All reads from S3 ---
         for (int q = 0; q < NUM_QUERIES; q++) {
             try {
-                // Delete the entire cache dir so the VFS starts truly cold:
-                // no local file, no bitmap, manifest fetched from S3.
+                // Delete BOTH the cache dir and the DB dir so everything starts
+                // truly cold: VFS fetches manifest + pages from S3, Kuzu rebuilds
+                // catalog from the data file. Without deleting dbPath, Kuzu's
+                // checkpoint metadata can become inconsistent with S3 state.
                 if (!localMode) {
                     std::filesystem::remove_all(cacheDir);
+                    std::filesystem::remove_all(dbPath);
                 }
 
                 std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
