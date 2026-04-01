@@ -126,4 +126,4 @@ The extension compiles against LadybugDB headers (requires `LADYBUG_DIR`). The c
 
 ## License
 
-MIT
+Apache-2.0
