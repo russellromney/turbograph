@@ -28,7 +28,7 @@ struct TieredConfig {
     std::string dataFilePath;                    // Exact path of the .kz data file to intercept.
     uint32_t pageSize = 4096;                    // Must match LBUG_PAGE_SIZE.
     int compressionLevel = 3;                    // zstd compression level.
-    uint32_t pagesPerGroup = 2048;               // Pages per page group (2048 * 4KB = 8MB).
+    uint32_t pagesPerGroup = 4096;               // Pages per page group (4096 * 4KB = 16MB).
     uint32_t subPagesPerFrame = 4;               // Pages per seekable sub-frame (4 * 4KB = 16KB raw).
 
     // Named prefetch schedules. Each entry controls how many page groups to
