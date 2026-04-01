@@ -55,8 +55,10 @@ All via environment variables:
 |---|---|---|
 | `BENCH_PERSONS` | 100000 | Number of person nodes |
 | `BUFFER_POOL_MB` | 256 | Kuzu buffer pool size |
-| `PREFETCH_HOPS` | 0.33,0.33 | Hop schedule (comma-separated floats) |
-| `PREFETCH_THREADS` | 8 | Background prefetch worker threads |
+| `PREFETCH_SCAN` | 0.3,0.3,0.4 | Scan schedule (aggressive, for edge traversals) |
+| `PREFETCH_LOOKUP` | 0,0,0 | Lookup schedule (conservative, 3 free hops) |
+| `PREFETCH_DEFAULT` | 0.33,0.33 | Default schedule (fallback) |
+| `PREFETCH_THREADS` | ncpus-1 | Background prefetch worker threads (0 = auto) |
 | `SUB_PAGES_PER_FRAME` | 4 | Pages per seekable frame (0 = legacy) |
 
 ## Queries

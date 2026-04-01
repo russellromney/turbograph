@@ -575,10 +575,10 @@ void TieredFileSystem::evictLocalGroup(uint64_t pageGroupId) {
     auto startPage = pageGroupId * ti.pagesPerGroup;
     ti.bitmap->clearRange(startPage, ti.pagesPerGroup);
 
-    // 3. Punch hole in local cache file to reclaim NVMe blocks.
+    // 3. Punch hole in local cache file to reclaim NVMe blocks (Linux only).
+#ifdef __linux__
     auto offset = static_cast<off_t>(startPage * ti.pageSize);
     auto len = static_cast<off_t>(ti.pagesPerGroup * ti.pageSize);
-#ifdef __linux__
     ::fallocate(ti.localFd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
 #endif
 }
