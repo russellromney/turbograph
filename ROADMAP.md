@@ -160,37 +160,46 @@ the cache needs a size limit and automatic eviction under pressure.
 ## Phase Orbit: graphstream Replication Integration
 > After: Phase Glacier · Before: Phase Apex
 
-Integrate graphstream (Kuzu journal replication) so turbograph's checkpoint
-doubles as the hadb snapshot. Same pattern as turbolite + walrust.
+Integrate graphstream directly into turbograph for journal-based replication
+to S3. Same pattern as turbolite + walrust. turbograph owns the replication;
+hakuzu is an optional layer on top for HA (leader election, write forwarding).
 
 ### a. Checkpoint as snapshot
 - [ ] On checkpoint (doSyncFile), after flushing page groups to S3, update manifest
-- [ ] Manifest version is the replication cursor for hakuzu
+- [ ] Manifest version is the replication cursor
 - [ ] Replicas open with manifest, fetch page groups on demand
 - [ ] No separate full-DB snapshot needed: page groups *are* the snapshot
 
 ### b. graphstream journal integration
-- [ ] After each write transaction, capture journal segment via graphstream
-- [ ] Upload journal segments to S3 (graphstream handles this)
-- [ ] On follower: apply journal segments to local DB, then checkpoint flushes to page groups
+- [ ] Add optional `graphstream::JournalWriter` to TieredConfig
+- [ ] After each Kuzu write transaction, capture journal segment via graphstream
+- [ ] Upload journal segments to S3 (graphstream handles upload via hadb-io)
 - [ ] Journal segments are the WAL; page groups are the checkpoint
+- [ ] When disabled (no JournalWriter), turbograph is tiered-only, no replication
 
-### c. Follower cold start
-- [ ] Follower reads manifest from S3 to get latest checkpoint state
-- [ ] Beacon fetches structural pages, metadata parser builds table map
-- [ ] Follower serves read queries from S3-backed cache immediately
-- [ ] Then pulls journal segments since last checkpoint for catch-up
+### c. Restore from S3
+- [ ] On open, check S3 for manifest + journal segments
+- [ ] Fetch latest checkpoint (manifest + page groups via Beacon)
+- [ ] Replay journal segments since last checkpoint to catch up
+- [ ] Single-writer recovery: node dies, new node restores from S3
 
-### d. Leader election coordination
-- [ ] hakuzu's LeaseStore determines who writes the manifest
-- [ ] On promotion: follower catches up journal, takes lease, becomes writer
-- [ ] On demotion: leader stops writing, releases lease
+### d. Read replica support
+- [ ] Read-only mode: open with manifest, serve queries from S3-backed cache
+- [ ] Poll S3 for new journal segments, apply incrementally
+- [ ] No write path, no lease needed
+- [ ] Useful without hakuzu (simple read scaling)
+
+### e. hakuzu HA (optional, not in turbograph)
+- [ ] hakuzu adds leader election via LeaseStore on top of turbograph + graphstream
+- [ ] On promotion: replica catches up journal, takes lease, becomes writer
+- [ ] On demotion: writer stops, releases lease, becomes replica
 - [ ] turbograph is unaware of HA roles; it just reads/writes via the VFS
 
-### e. Tests
-- [ ] Integration: leader writes, checkpoint, follower reads via manifest
-- [ ] Integration: leader crash, follower promotes, serves queries
+### f. Tests
 - [ ] Unit: manifest version advances on checkpoint
+- [ ] Integration: write, checkpoint, restore from S3 on fresh node
+- [ ] Integration: writer + read replica, replica sees new data after journal poll
+- [ ] Integration (with hakuzu): leader crash, follower promotes, serves queries
 
 ---
 
