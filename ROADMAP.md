@@ -157,22 +157,59 @@ the cache needs a size limit and automatic eviction under pressure.
 
 ---
 
-## Phase Column: Structure-Aware Page Grouping
-> After: Phase Glacier · Before: (future)
+## Phase Orbit: graphstream Replication Integration
+> After: Phase Glacier · Before: Phase Apex
+
+Integrate graphstream (Kuzu journal replication) so turbograph's checkpoint
+doubles as the hadb snapshot. Same pattern as turbolite + walrust.
+
+### a. Checkpoint as snapshot
+- [ ] On checkpoint (doSyncFile), after flushing page groups to S3, update manifest
+- [ ] Manifest version is the replication cursor for hakuzu
+- [ ] Replicas open with manifest, fetch page groups on demand
+- [ ] No separate full-DB snapshot needed: page groups *are* the snapshot
+
+### b. graphstream journal integration
+- [ ] After each write transaction, capture journal segment via graphstream
+- [ ] Upload journal segments to S3 (graphstream handles this)
+- [ ] On follower: apply journal segments to local DB, then checkpoint flushes to page groups
+- [ ] Journal segments are the WAL; page groups are the checkpoint
+
+### c. Follower cold start
+- [ ] Follower reads manifest from S3 to get latest checkpoint state
+- [ ] Beacon fetches structural pages, metadata parser builds table map
+- [ ] Follower serves read queries from S3-backed cache immediately
+- [ ] Then pulls journal segments since last checkpoint for catch-up
+
+### d. Leader election coordination
+- [ ] hakuzu's LeaseStore determines who writes the manifest
+- [ ] On promotion: follower catches up journal, takes lease, becomes writer
+- [ ] On demotion: leader stops writing, releases lease
+- [ ] turbograph is unaware of HA roles; it just reads/writes via the VFS
+
+### e. Tests
+- [ ] Integration: leader writes, checkpoint, follower reads via manifest
+- [ ] Integration: leader crash, follower promotes, serves queries
+- [ ] Unit: manifest version advances on checkpoint
+
+---
+
+## Phase Apex: Structure-Aware Page Grouping
+> After: Phase Orbit · Before: (future)
 
 Only pursue if benchmarks show page group misses are the bottleneck.
 
-### a. Column-aware grouping
+### a. Locality-aware grouping
 - [ ] Co-locate CSR offset/length pages with edge data in same group
-- [ ] Group column chunks within same node group together
+- [ ] Group pages within same node group together
 - [ ] One edge traversal step = one S3 GET
 
 ### b. Neighborhood-aware prefetch
 - [ ] Parse destination node IDs from CSR data on fetch completion
 - [ ] Prefetch page groups containing destination nodes before query asks
 
-### c. Column-selective fetch
-- [ ] Organize page groups per-column for selective range GETs
+### c. Selective fetch
+- [ ] Organize page groups per-table for selective range GETs
 
 ---
 
