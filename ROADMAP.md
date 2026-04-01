@@ -127,8 +127,38 @@ Compress then encrypt for S3. OpenSSL provides both ciphers (already linked).
 
 ---
 
+## Phase Glacier: Automatic Cache Eviction
+> After: Phase Vault · Before: Phase Column
+
+Today the cache grows unbounded. For production (shared volumes, multi-tenant),
+the cache needs a size limit and automatic eviction under pressure.
+
+### a. Cache size limit
+- [ ] Add `maxCacheBytes` to `TieredConfig` (0 = unlimited, default)
+- [ ] Track current cache size via bitmap `presentCount() * pageSize`
+- [ ] Eviction check after every `fetchAndStoreGroup`: if over limit, evict
+
+### b. Eviction priority (tiered)
+- [ ] Structural pages (catalog, metadata, page 0): never evicted
+- [ ] Index pages (hash index, PIP): evicted only under heavy pressure
+- [ ] Data pages (column chunks, CSR edges, overflow): evicted first
+- [ ] Use existing `structuralPages` / `indexPages` bitmaps for classification
+
+### c. Eviction strategy
+- [ ] Track per-group last access time (or access count) in a parallel array
+- [ ] On eviction: find coldest data groups, call `evictLocalGroup()` until under limit
+- [ ] `evictLocalGroup` already handles bitmap clear, group state reset, hole punch (Linux)
+- [ ] Batch eviction: evict enough groups to get to 80% of limit (avoid thrashing)
+
+### d. Tests
+- [ ] Unit: cache fills to limit, eviction triggers, structural pages survive
+- [ ] Unit: access tracking updates on read, coldest groups evicted first
+- [ ] Integration: continuous queries with small cache limit, verify no crashes or data loss
+
+---
+
 ## Phase Column: Structure-Aware Page Grouping
-> After: Phase Vault · Before: (future)
+> After: Phase Glacier · Before: (future)
 
 Only pursue if benchmarks show page group misses are the bottleneck.
 
@@ -153,11 +183,6 @@ Only pursue if benchmarks show page group misses are the bottleneck.
 - Each frame gets its own atomic state
 - Eliminates slingshot's "keep group FETCHING" workaround
 - frameStates array: totalGroups * framesPerGroup entries
-
-### Tiered eviction priorities
-- Structural pages (catalog, PIP, CSR headers): never evicted
-- Edge adjacency data: evicted only under pressure
-- Property columns: evicted first
 
 ### turbograph-tune CLI
 - Sweep schedule grid against real queries
