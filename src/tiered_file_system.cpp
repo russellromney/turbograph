@@ -167,6 +167,68 @@ const std::vector<float>& TieredFileSystem::getActiveHops() const {
     return config_.schedules.defaultSchedule;
 }
 
+const std::vector<float>& TieredFileSystem::getHopsForTable(bool isRelationship) const {
+    // Relationship tables (CSR edge data) -> aggressive scan schedule.
+    // Node tables (hash index access) -> conservative lookup schedule.
+    if (isRelationship) return config_.schedules.scan;
+    return config_.schedules.lookup;
+}
+
+void TieredFileSystem::setTablePageMap(std::unique_ptr<TablePageMap> map) {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return;
+    if (!map) {
+        afi->tablePageMap.reset();
+        afi->tableMissCounters.reset();
+        return;
+    }
+    if (map->size() > 0) {
+        map->finalize();
+        afi->tableMissCounters = std::make_unique<TableMissCounters>(map->maxTableId());
+    }
+    afi->tablePageMap = std::move(map);
+}
+
+bool TieredFileSystem::hasTablePageMap() const {
+    auto* afi = activeFileInfo_.load();
+    return afi && afi->tablePageMap;
+}
+
+void TieredFileSystem::setMetadataParser(MetadataParserFn fn) {
+    metadataParser_ = std::move(fn);
+}
+
+uint64_t TieredFileSystem::prefetchTables(const std::vector<uint32_t>& tableIds) {
+    auto* afi = activeFileInfo_.load();
+    if (!afi || !afi->tablePageMap) return 0;
+
+    // Collect all page groups that belong to any of the requested tables.
+    std::unordered_set<uint32_t> tidSet(tableIds.begin(), tableIds.end());
+    std::vector<uint64_t> groups;
+    for (const auto& interval : afi->tablePageMap->intervals()) {
+        if (!tidSet.count(interval.tableId)) continue;
+
+        // Convert page range to page group range.
+        uint64_t startGroup = interval.startPage / afi->pagesPerGroup;
+        uint64_t endPage = interval.endPage; // exclusive
+        uint64_t endGroup = (endPage + afi->pagesPerGroup - 1) / afi->pagesPerGroup;
+        for (uint64_t g = startGroup; g < endGroup && g < afi->totalGroups; g++) {
+            if (afi->getGroupState(g) == GroupState::NONE) {
+                groups.push_back(g);
+            }
+        }
+    }
+
+    // Deduplicate (intervals from different columns in the same table may overlap in groups).
+    std::sort(groups.begin(), groups.end());
+    groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+
+    if (!groups.empty()) {
+        submitPrefetch(*afi, groups);
+    }
+    return groups.size();
+}
+
 TieredFileSystem::~TieredFileSystem() {
     // Stop prefetch pool before flushing.
     drainPrefetchAndWait();
@@ -389,6 +451,21 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
                 for (auto gid : toFetch) {
                     info->waitForGroup(gid);
                 }
+            }
+
+            // --- Phase Volley: Parse metadata pages for per-table prefetch ---
+            // Metadata pages are now in local cache (Beacon fetched their groups).
+            // If a parser callback is registered (extension layer), read metadata
+            // pages into a contiguous buffer and parse to build a page-to-table map.
+            if (metadataParser_ && metaStart != UINT32_MAX && metaPages > 0) {
+                std::vector<uint8_t> metaBuf(
+                    static_cast<size_t>(metaPages) * m.pageSize);
+                for (uint32_t p = 0; p < metaPages; p++) {
+                    auto page = readOnePage(*info, metaStart + p);
+                    std::memcpy(metaBuf.data() + p * m.pageSize,
+                        page.data(), m.pageSize);
+                }
+                setTablePageMap(metadataParser_(metaBuf.data(), metaBuf.size()));
             }
         }
     }
@@ -779,6 +856,13 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
     // 3. Check bitmap — if page is in local file, pread it.
     if (ti.bitmap->isPresent(pageNum)) {
         ti.consecutiveMisses = 0;
+        // Reset per-table miss counter on cache hit.
+        if (ti.tablePageMap && ti.tableMissCounters) {
+            auto result = ti.tablePageMap->lookup(static_cast<uint32_t>(pageNum));
+            if (result.found) {
+                ti.tableMissCounters->reset(result.tableId);
+            }
+        }
         std::vector<uint8_t> page(ti.pageSize);
         auto offset = static_cast<off_t>(pageNum * ti.pageSize);
         auto bytesRead = ::pread(ti.localFd, page.data(), ti.pageSize, offset);
@@ -881,9 +965,30 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
 
     // 7. Compute prefetch groups and submit asynchronously (only with group tracking).
     if (!skipGroupTracking) {
-        if (ti.consecutiveMisses < 255) {
-            ti.consecutiveMisses++;
+        // Select hops schedule and miss count based on which table this page belongs to.
+        const std::vector<float>* hops;
+        uint8_t missCount;
+
+        if (ti.tablePageMap && ti.tableMissCounters) {
+            auto tableLookup = ti.tablePageMap->lookup(static_cast<uint32_t>(pageNum));
+            if (tableLookup.found) {
+                ti.tableMissCounters->increment(tableLookup.tableId);
+                hops = &getHopsForTable(tableLookup.isRelationship);
+                missCount = ti.tableMissCounters->get(tableLookup.tableId);
+            } else {
+                // Page not in any known table (structural/metadata page).
+                if (ti.consecutiveMisses < 255) ti.consecutiveMisses++;
+                hops = &getActiveHops();
+                missCount = ti.consecutiveMisses;
+            }
+        } else {
+            // No table map yet (empty DB, tables created after open).
+            if (ti.consecutiveMisses < 255) ti.consecutiveMisses++;
+            hops = &getActiveHops();
+            missCount = ti.consecutiveMisses;
         }
+
+        if (missCount == 0) missCount = 1; // First miss is at least 1.
 
         uint64_t totalPageGroups = 0;
         {
@@ -892,20 +997,19 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
                 (ti.manifest.pageCount + ti.pagesPerGroup - 1) / ti.pagesPerGroup;
         }
 
-        const auto& hops = getActiveHops();
         float hopSum = 0;
-        for (auto v : hops) hopSum += v;
+        for (auto v : *hops) hopSum += v;
         bool fractionMode = (hopSum <= 1.01f);
 
-        auto hopIdx = static_cast<size_t>(ti.consecutiveMisses - 1);
+        auto hopIdx = static_cast<size_t>(missCount - 1);
         uint64_t prefetchCount;
-        if (hopIdx >= hops.size()) {
+        if (hopIdx >= hops->size()) {
             prefetchCount = totalPageGroups;
         } else if (fractionMode) {
             prefetchCount = std::max(uint64_t{1},
-                static_cast<uint64_t>(hops[hopIdx] * totalPageGroups));
+                static_cast<uint64_t>((*hops)[hopIdx] * totalPageGroups));
         } else {
-            prefetchCount = static_cast<uint64_t>(hops[hopIdx]);
+            prefetchCount = static_cast<uint64_t>((*hops)[hopIdx]);
         }
 
         // Build prefetch list — fan out from current group, skip PRESENT/FETCHING.

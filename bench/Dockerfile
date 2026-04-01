@@ -25,7 +25,7 @@ RUN cd ladybug-fork && \
 COPY turbograph/ /build/turbograph/
 
 # Build turbograph + cypher_bench.
-# Use shared OpenSSL to avoid static libcrypto's zstd dependency.
+# LADYBUG_DIR is used for both liblbug headers and the extension's table_map_builder.
 RUN cd turbograph && \
     cmake -B build/release \
     -DCMAKE_BUILD_TYPE=Release \

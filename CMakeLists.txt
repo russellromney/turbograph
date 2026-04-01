@@ -44,7 +44,16 @@ include_directories(include)
 # When BUILD_BENCH is ON and LADYBUG_DIR is set, real Kuzu headers take precedence.
 if(BUILD_BENCH AND DEFINED LADYBUG_DIR)
     include_directories(${LADYBUG_DIR}/src/include)
-    include_directories(${CMAKE_BINARY_DIR}/src/include)
+    # Generated headers (system_config.h etc.) live in the LadybugDB build tree.
+    if(EXISTS "${LADYBUG_DIR}/build/release/src/include")
+        include_directories(${LADYBUG_DIR}/build/release/src/include)
+    elseif(EXISTS "${LADYBUG_DIR}/build/src/include")
+        include_directories(${LADYBUG_DIR}/build/src/include)
+    endif()
+    # Third-party headers needed by table_map_builder (compression.h -> alp/state.hpp).
+    # Only include alp; globbing all third_party picks up LadybugDB's namespaced zstd
+    # which conflicts with system zstd used by turbograph core.
+    include_directories(${LADYBUG_DIR}/third_party/alp/include)
 else()
     include_directories(stubs)
 endif()
@@ -70,6 +79,7 @@ add_library(turbograph STATIC
     src/chunk_codec.cpp
     src/manifest.cpp
     src/page_bitmap.cpp
+    src/table_page_map.cpp
     src/tiered_file_system.cpp
     src/file_system_stubs.cpp)
 

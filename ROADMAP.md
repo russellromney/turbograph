@@ -51,7 +51,7 @@ which table a page belongs to.
 ---
 
 ## Phase Cypher: Query Plan Frontrunning
-> After: Phase Volley · Before: Phase Column
+> After: Phase Volley · Before: Phase Vault
 
 Parse Kuzu's query plan before execution to prefetch tables proactively.
 
@@ -71,8 +71,64 @@ Parse Kuzu's query plan before execution to prefetch tables proactively.
 
 ---
 
+## Phase Vault: Page-Level Encryption and Compression on Disk
+> After: Phase Cypher · Before: Phase Column
+
+Encrypt pages at rest on local NVMe cache and in S3. Same architecture as
+turbolite: CTR for cache (fast, no overhead), GCM for S3 (authenticated).
+Compress then encrypt for S3. OpenSSL provides both ciphers (already linked).
+
+### a. Crypto primitives
+- [ ] Add `encryption_key: std::optional<std::array<uint8_t, 32>>` to `TieredConfig`
+- [ ] Implement `aes256_ctr_encrypt(data, page_num, key)` / `aes256_ctr_decrypt(data, page_num, key)`
+  - IV = page_num as 8-byte LE, zero-padded to 16 bytes
+  - No size overhead (ciphertext = plaintext)
+  - OpenSSL `EVP_aes_256_ctr`
+- [ ] Implement `aes256_gcm_encrypt(data, key)` / `aes256_gcm_decrypt(data, key)`
+  - Random 12-byte nonce, prepended to ciphertext
+  - 16-byte auth tag appended
+  - 28 bytes overhead per frame (nonce + tag)
+  - OpenSSL `EVP_aes_256_gcm`
+- [ ] Put these in `crypto.cpp` / `crypto.h`
+- [ ] Tests: round-trip, wrong key fails, deterministic CTR nonce, GCM auth rejection
+
+### b. Local cache encryption (CTR)
+- [ ] In `readOnePage`: after `pread`, CTR decrypt if key is set
+- [ ] In `writeOnePage` (dirty page flush to cache): CTR encrypt before `pwrite`
+- [ ] In `fetchAndStoreGroup` (S3 -> cache): CTR encrypt each page before `pwrite`
+- [ ] Cache hit path: `pread` -> CTR decrypt -> return plaintext
+- [ ] Zero size overhead: page offsets and bitmap unchanged
+- [ ] Tests: write encrypted, read decrypted, wrong key returns garbage
+
+### c. S3 encryption (GCM)
+- [ ] In `flushPendingPageGroups` (encode path): after zstd compress, GCM encrypt each frame
+  - Seekable encoding: per-frame GCM (each frame gets own random nonce)
+  - Legacy encoding: single GCM wrap around whole compressed blob
+- [ ] In `fetchAndStoreGroup` (decode path): GCM decrypt before zstd decompress
+- [ ] In `fetchAndStoreFrame` (range GET path): GCM decrypt the individual frame
+- [ ] Update `FrameEntry.len` in manifest to include 28-byte GCM overhead
+- [ ] Tests: round-trip via S3, tampered blob rejected, manifest frame offsets correct
+
+### d. Key management
+- [ ] Key set via `TieredConfig` (application provides the 32 bytes)
+- [ ] Env var support: `TURBOGRAPH_ENCRYPTION_KEY` (hex-encoded 64 chars)
+- [ ] Extension option: `turbograph_encryption_key` (confidential STRING, hex)
+- [ ] Key is per-database, same for all pages and S3 objects
+- [ ] Key never stored on disk. Provided at runtime via env var or extension option.
+- [ ] Manifest records `"encrypted": true` flag (not the key). Opening an encrypted
+  database without a key gives a clear error instead of a cryptic GCM auth failure.
+- [ ] No key rotation in MVP (future: re-download, re-encrypt, re-upload all objects)
+
+### e. Compression dictionary (future)
+- [ ] Train zstd dictionary on first checkpoint's page data
+- [ ] Store dictionary in manifest (or as separate S3 object)
+- [ ] Pass dictionary to zstd compress/decompress in encode/decode paths
+- [ ] 2-5x better compression on structured columnar data
+
+---
+
 ## Phase Column: Structure-Aware Page Grouping
-> After: Phase Cypher · Before: (future)
+> After: Phase Vault · Before: (future)
 
 Only pursue if benchmarks show page group misses are the bottleneck.
 

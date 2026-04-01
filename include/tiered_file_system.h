@@ -4,12 +4,14 @@
 #include "manifest.h"
 #include "page_bitmap.h"
 #include "s3_client.h"
+#include "table_page_map.h"
 
 #include "common/file_system/file_system.h"
 
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -80,7 +82,14 @@ struct TieredFileInfo : public common::FileInfo {
     int compressionLevel;
     uint32_t pagesPerGroup;
 
-    mutable uint8_t consecutiveMisses = 0; // For hop-based adaptive prefetch.
+    mutable uint8_t consecutiveMisses = 0; // For structural/metadata pages not in any table.
+
+    // Per-table prefetch state. Built from metadata pages during openFile().
+    // readOnePage() uses per-table miss counters to select schedule:
+    // relationship tables -> scan, node tables -> lookup.
+    // Pages not in the map (structural/metadata) use consecutiveMisses + active schedule.
+    std::unique_ptr<TablePageMap> tablePageMap;
+    std::unique_ptr<TableMissCounters> tableMissCounters;
 
     // Page classification bitmaps for selective cache eviction.
     // Structural: page 0, catalog, metadata -- read during Database() construction.
@@ -137,6 +146,27 @@ public:
 
     // Set a custom schedule by name. Overwrites the named slot.
     void setSchedule(const std::string& name, const std::vector<float>& hops);
+
+    // Install a page-to-table mapping on the active file info.
+    // After this call, readOnePage() uses per-table miss counters and
+    // auto-selects prefetch schedules (rel -> scan, node -> lookup).
+    void setTablePageMap(std::unique_ptr<TablePageMap> map);
+
+    // Check whether per-table prefetch is active.
+    bool hasTablePageMap() const;
+
+    // Proactively prefetch all page groups belonging to the given table IDs.
+    // Used by Phase Cypher to warm tables before query execution.
+    // Returns the number of page groups submitted to the prefetch pool.
+    uint64_t prefetchTables(const std::vector<uint32_t>& tableIds);
+
+    // Parses metadata pages into a TablePageMap during openFile().
+    // Set by the extension during load(). Takes raw metadata bytes + length.
+    using MetadataParserFn = std::function<std::unique_ptr<TablePageMap>(
+        const uint8_t* data, size_t len)>;
+
+    // Register the metadata parser. Runs in openFile() after Beacon.
+    void setMetadataParser(MetadataParserFn fn);
 
     // Expose S3 client for I/O counters (benchmarking).
     S3Client& s3() { return *s3_; }
@@ -248,6 +278,10 @@ private:
     std::string activeScheduleName_ = "scan"; // Graph queries are almost all traversals.
     mutable std::mutex scheduleMu_;
     const std::vector<float>& getActiveHops() const;
+    const std::vector<float>& getHopsForTable(bool isRelationship) const;
+
+    // Metadata parser callback, set by extension layer.
+    MetadataParserFn metadataParser_;
 
     // Raw pointer to the active TieredFileInfo, set in openFile().
     // Used by flushPendingPageGroups() and clearCache() to access file state.

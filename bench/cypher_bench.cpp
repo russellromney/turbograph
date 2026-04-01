@@ -8,6 +8,8 @@
 //        TIGRIS_STORAGE_ENDPOINT=... ./cypher_bench
 
 #include "tiered_file_system.h"
+#include "table_page_map.h"
+#include "main/turbograph_functions.h"
 
 #include "main/connection.h"
 #include "main/database.h"
@@ -314,6 +316,20 @@ struct LatencyStats {
     }
 };
 
+// Phase Cypher: prepare query to get the plan, extract table IDs, prefetch their page groups.
+// Returns number of groups submitted (0 if no TFS or no table map).
+static uint64_t frontrunPrefetch(lbug::main::Connection& conn,
+    lbug::tiered::TieredFileSystem* tfs, const char* cypher) {
+    if (!tfs) return 0;
+    auto [nodeIds, relIds] =
+        lbug::turbograph_extension::extractTablesFromPlan(conn, cypher);
+    std::vector<uint32_t> allIds;
+    for (auto id : nodeIds) allIds.push_back(static_cast<uint32_t>(id));
+    for (auto id : relIds) allIds.push_back(static_cast<uint32_t>(id));
+    if (allIds.empty()) return 0;
+    return tfs->prefetchTables(allIds);
+}
+
 static std::string formatUs(int64_t us) {
     char buf[32];
     if (us >= 1000000) {
@@ -591,6 +607,11 @@ int main(int argc, char** argv) {
             if (tfs) tfs->setActiveSchedule(QUERIES[q].schedule);
             lbug::main::Connection conn(&db);
 
+            // Phase Cypher: frontrun prefetch (skip for warm).
+            if (std::strcmp(label, "warm") != 0) {
+                frontrunPrefetch(conn, tfs, QUERIES[q].cypher);
+            }
+
             auto start = Clock::now();
             auto result = conn.query(QUERIES[q].cypher);
             auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -623,11 +644,14 @@ int main(int argc, char** argv) {
                 std::filesystem::remove_all(coldCacheDir);
 
                 lbug::tiered::S3Client* coldS3 = nullptr;
+                lbug::tiered::TieredFileSystem* coldTfsPtr = nullptr;
                 std::vector<std::unique_ptr<lbug::common::FileSystem>> coldFsList;
                 if (!localMode) {
                     auto coldCfg = tieredCfg;
                     coldCfg.cacheDir = coldCacheDir;
                     auto coldTfs = std::make_unique<lbug::tiered::TieredFileSystem>(coldCfg);
+                    coldTfs->setMetadataParser(lbug::turbograph_extension::parseMetadataPages);
+                    coldTfsPtr = coldTfs.get();
                     coldS3 = &coldTfs->s3();
                     coldS3->resetCounters();
                     coldFsList.push_back(std::move(coldTfs));
@@ -638,6 +662,13 @@ int main(int argc, char** argv) {
                 coldSysCfg.autoCheckpoint = false;
                 lbug::main::Database coldDb(dbPath, coldSysCfg, std::move(coldFsList));
                 lbug::main::Connection conn(&coldDb);
+
+                // Phase Cypher: frontrun prefetch before query execution.
+                auto submitted = frontrunPrefetch(conn, coldTfsPtr, QUERIES[q].cypher);
+                if (submitted > 0) {
+                    std::printf("    [frontrun] %s: %llu groups\n",
+                        QUERIES[q].name, (unsigned long long)submitted);
+                }
 
                 auto start = Clock::now();
                 auto result = conn.query(QUERIES[q].cypher);
@@ -668,6 +699,7 @@ int main(int argc, char** argv) {
         lbug::tiered::S3Client* s3Ptr = nullptr;
         if (!localMode) {
             auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
+            tfs->setMetadataParser(lbug::turbograph_extension::parseMetadataPages);
             tfsPtr = tfs.get();
             s3Ptr = &tfs->s3();
             fsList.push_back(std::move(tfs));
@@ -681,6 +713,9 @@ int main(int argc, char** argv) {
         if (tfsPtr) tfsPtr->beginTrackStructural();
         lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
         if (tfsPtr) tfsPtr->endTrack();
+
+        std::printf("  Per-table prefetch: %s\n",
+            (tfsPtr && tfsPtr->hasTablePageMap()) ? "active" : "inactive");
 
         // Track index pages during a warmup query.
         if (tfsPtr) tfsPtr->beginTrackIndex();

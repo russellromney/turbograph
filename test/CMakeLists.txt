@@ -29,6 +29,11 @@ add_executable(test_prefetch test_prefetch.cpp)
 target_link_libraries(test_prefetch PRIVATE turbograph)
 add_test(NAME PrefetchTest COMMAND test_prefetch)
 
+# Unit test: table page map (interval map + per-table miss counters)
+add_executable(test_table_page_map test_table_page_map.cpp)
+target_link_libraries(test_table_page_map PRIVATE turbograph)
+add_test(NAME TablePageMapTest COMMAND test_table_page_map)
+
 # Integration test: S3/Tigris (requires credentials)
 add_executable(test_s3_integration test_s3_integration.cpp)
 target_link_libraries(test_s3_integration PRIVATE turbograph)

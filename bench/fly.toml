@@ -11,7 +11,11 @@ primary_region = 'iad'
   source = "bench_data"
   destination = "/data"
 
+[env]
+  BENCH_PERSONS = "1000000"
+  BUFFER_POOL_MB = "1024"
+
 [[vm]]
-  memory = '4gb'
-  cpu_kind = 'shared'
+  memory = '8gb'
+  cpu_kind = 'performance'
   cpus = 4
