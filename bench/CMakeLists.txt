@@ -11,13 +11,13 @@ if(APPLE AND EXISTS "/opt/homebrew/opt/llvm/lib/c++")
     link_directories("/opt/homebrew/opt/llvm/lib/c++")
 endif()
 
-# Include extension headers for parseMetadataPages.
-include_directories(${LADYBUG_DIR}/extension/turbograph/include)
+# Include extension headers.
+include_directories(${PROJECT_SOURCE_DIR}/extension/include)
 
 add_executable(cypher_bench
     cypher_bench.cpp
-    ${LADYBUG_DIR}/extension/turbograph/src/functions/table_map_builder.cpp
-    ${LADYBUG_DIR}/extension/turbograph/src/functions/plan_prefetch.cpp)
+    ${PROJECT_SOURCE_DIR}/extension/src/functions/table_map_builder.cpp
+    ${PROJECT_SOURCE_DIR}/extension/src/functions/plan_prefetch.cpp)
 
 # Find all static libraries from the LadybugDB build tree.
 # liblbug.a depends on parquet, antlr4, utf8proc, etc. -- all built as .a files.
