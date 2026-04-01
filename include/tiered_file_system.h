@@ -245,7 +245,7 @@ private:
     mutable std::mutex existsMu_;
 
     // Active prefetch schedule.
-    std::string activeScheduleName_ = "default";
+    std::string activeScheduleName_ = "scan"; // Graph queries are almost all traversals.
     mutable std::mutex scheduleMu_;
     const std::vector<float>& getActiveHops() const;
 
