@@ -59,6 +59,13 @@ struct TurbographSetManifestFunction {
     static function::function_set getFunctionSet();
 };
 
+// Phase GraphBridge: turbograph_get_manifest() -> STRING
+// Returns the current manifest as a JSON string. Does not sync.
+struct TurbographGetManifestFunction {
+    static constexpr const char* name = "turbograph_get_manifest";
+    static function::function_set getFunctionSet();
+};
+
 // Phase Cypher: extract table IDs from a Cypher query's logical plan.
 // Returns (nodeTableIds, relTableIds). Does not execute the query.
 std::pair<std::unordered_set<common::table_id_t>, std::unordered_set<common::table_id_t>>

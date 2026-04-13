@@ -128,6 +128,7 @@ void TurbographExtension::load(main::ClientContext* context) {
     extension::ExtensionUtils::addScalarFunc<TurbographSyncFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographGetManifestVersionFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographSetManifestFunction>(*db);
+    extension::ExtensionUtils::addScalarFunc<TurbographGetManifestFunction>(*db);
 }
 
 } // namespace turbograph_extension

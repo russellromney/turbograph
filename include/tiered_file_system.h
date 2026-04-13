@@ -216,6 +216,10 @@ public:
     // Return the current manifest version without syncing.
     uint64_t getManifestVersion() const;
 
+    // Phase GraphBridge: return the current manifest as a JSON string.
+    // Does not sync. Returns the last-synced manifest state.
+    std::string getManifestJSON() const;
+
     // Follower: apply a remote manifest received from the leader.
     // Parses JSON, compares versions, invalidates cache for changed groups,
     // sets the new manifest as active. Returns the new version.

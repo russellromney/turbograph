@@ -2231,6 +2231,14 @@ uint64_t TieredFileSystem::getManifestVersion() const {
     return afi->manifest.version;
 }
 
+std::string TieredFileSystem::getManifestJSON() const {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return "{}";
+
+    std::lock_guard lock(afi->manifestMu);
+    return afi->manifest.toJSON();
+}
+
 uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
     auto parsed = Manifest::fromJSON(jsonStr);
     if (!parsed.has_value()) {

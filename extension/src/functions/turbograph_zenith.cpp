@@ -79,6 +79,38 @@ function_set TurbographGetManifestVersionFunction::getFunctionSet() {
     return result;
 }
 
+// --- turbograph_get_manifest() -> STRING (Phase GraphBridge) ---
+
+static void getManifestExec(const std::vector<std::shared_ptr<ValueVector>>& /*parameters*/,
+    const std::vector<SelectionVector*>& /*parameterSelVectors*/, ValueVector& result,
+    SelectionVector* resultSelVector, void* /*dataPtr*/) {
+    auto* tfs = TurbographExtension::tfs;
+
+    for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
+        auto resultPos = (*resultSelVector)[i];
+
+        if (!tfs) {
+            result.setNull(resultPos, true);
+            continue;
+        }
+
+        try {
+            auto json = tfs->getManifestJSON();
+            result.setNull(resultPos, false);
+            StringVector::addString(&result, resultPos, json);
+        } catch (const std::exception& e) {
+            result.setNull(resultPos, true);
+        }
+    }
+}
+
+function_set TurbographGetManifestFunction::getFunctionSet() {
+    function_set result;
+    result.push_back(std::make_unique<ScalarFunction>(name,
+        std::vector<LogicalTypeID>{}, LogicalTypeID::STRING, getManifestExec));
+    return result;
+}
+
 // --- turbograph_set_manifest(json STRING) -> INT64 ---
 
 static void setManifestExec(const std::vector<std::shared_ptr<ValueVector>>& parameters,
