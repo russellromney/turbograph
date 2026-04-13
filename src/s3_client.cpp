@@ -335,6 +335,13 @@ std::string S3Client::pageGroupKey(uint64_t groupId, uint64_t manifestVersion) c
            "_v" + std::to_string(manifestVersion);
 }
 
+std::string S3Client::overrideFrameKey(uint64_t groupId, size_t frameIdx,
+    uint64_t manifestVersion) const {
+    return config_.prefix + "/pg/" + std::to_string(groupId) +
+           "_f" + std::to_string(frameIdx) +
+           "_v" + std::to_string(manifestVersion);
+}
+
 // --- List Objects (S3 ListObjectsV2) ---
 
 std::vector<std::string> S3Client::listObjects(const std::string& prefix) {
@@ -404,6 +411,13 @@ uint64_t S3Client::evictStalePageGroups(const Manifest& manifest) {
 
     std::unordered_set<std::string> validKeys(
         manifest.pageGroupKeys.begin(), manifest.pageGroupKeys.end());
+
+    // Phase GraphDrift: override keys are also valid.
+    for (auto& ovMap : manifest.subframeOverrides) {
+        for (auto& [_, ov] : ovMap) {
+            validKeys.insert(ov.key);
+        }
+    }
 
     uint64_t deleted = 0;
     for (auto& key : allKeys) {

@@ -81,6 +81,7 @@ add_library(turbograph_extension_source
         # Extension glue (registration + UDFs + parsers).
         src/main/turbograph_extension.cpp
         src/functions/turbograph_config.cpp
+        src/functions/turbograph_zenith.cpp
         src/functions/table_map_builder.cpp
         src/functions/plan_prefetch.cpp)
 

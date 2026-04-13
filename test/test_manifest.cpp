@@ -86,6 +86,85 @@ static void testImmutableKeyNaming() {
     std::printf("  PASS: testImmutableKeyNaming\n");
 }
 
+// Phase GraphZenith: journal_seq round-trip
+static void testJournalSeqRoundTrip() {
+    Manifest m;
+    m.version = 10;
+    m.pageCount = 100;
+    m.pageSize = 4096;
+    m.pagesPerGroup = 2048;
+    m.pageGroupKeys = {"pg/0_v10"};
+    m.journalSeq = 42;
+
+    auto json = m.toJSON();
+    auto parsed = Manifest::fromJSON(json);
+    assert(parsed.has_value());
+    assert(parsed->journalSeq == 42);
+    std::printf("  PASS: testJournalSeqRoundTrip\n");
+}
+
+// Phase GraphZenith: journal_seq defaults to 0 when missing
+static void testJournalSeqDefaultsToZero() {
+    // JSON without journal_seq field
+    std::string json = R"({"version":5,"page_count":50,"page_size":4096,"pages_per_group":2048,"page_group_keys":["pg/0_v5"]})";
+    auto parsed = Manifest::fromJSON(json);
+    assert(parsed.has_value());
+    assert(parsed->journalSeq == 0);
+    std::printf("  PASS: testJournalSeqDefaultsToZero\n");
+}
+
+// Phase GraphZenith: journal_seq = 0 is omitted from JSON (backward compat)
+static void testJournalSeqZeroOmitted() {
+    Manifest m;
+    m.version = 1;
+    m.pageCount = 10;
+    m.pageSize = 4096;
+    m.pagesPerGroup = 2048;
+    m.pageGroupKeys = {"pg/0_v1"};
+    m.journalSeq = 0;
+
+    auto json = m.toJSON();
+    // journal_seq should not appear in output when 0.
+    assert(json.find("journal_seq") == std::string::npos);
+    std::printf("  PASS: testJournalSeqZeroOmitted\n");
+}
+
+// Phase GraphZenith: journal_seq > 0 appears in JSON
+static void testJournalSeqNonZeroPresent() {
+    Manifest m;
+    m.version = 1;
+    m.pageCount = 10;
+    m.pageSize = 4096;
+    m.pagesPerGroup = 2048;
+    m.pageGroupKeys = {"pg/0_v1"};
+    m.journalSeq = 999;
+
+    auto json = m.toJSON();
+    assert(json.find("\"journal_seq\":999") != std::string::npos);
+
+    auto parsed = Manifest::fromJSON(json);
+    assert(parsed.has_value());
+    assert(parsed->journalSeq == 999);
+    std::printf("  PASS: testJournalSeqNonZeroPresent\n");
+}
+
+// Phase GraphZenith: large journal_seq values
+static void testJournalSeqLargeValue() {
+    Manifest m;
+    m.version = 1;
+    m.pageCount = 10;
+    m.pageSize = 4096;
+    m.pagesPerGroup = 2048;
+    m.pageGroupKeys = {"pg/0_v1"};
+    m.journalSeq = 18446744073709551000ULL; // Near u64 max
+
+    auto json = m.toJSON();
+    auto parsed = Manifest::fromJSON(json);
+    assert(parsed.has_value());
+    assert(parsed->journalSeq == 18446744073709551000ULL);
+    std::printf("  PASS: testJournalSeqLargeValue\n");
+}
+
 int main() {
     std::printf("=== Manifest Tests ===\n");
     testRoundTrip();
@@ -93,6 +172,11 @@ int main() {
     testInvalidJSON();
     testLargeValues();
     testImmutableKeyNaming();
+    testJournalSeqRoundTrip();
+    testJournalSeqDefaultsToZero();
+    testJournalSeqZeroOmitted();
+    testJournalSeqNonZeroPresent();
+    testJournalSeqLargeValue();
     std::printf("All manifest tests passed.\n");
     return 0;
 }

@@ -8,11 +8,13 @@
 
 #include "common/file_system/file_system.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -50,6 +52,28 @@ struct TieredConfig {
     // Number of background threads for async prefetch.
     uint32_t prefetchThreads = 0; // 0 = auto (num_cpus - 1, min 1).
 
+    // Cache eviction. 0 = unlimited (default).
+    uint64_t maxCacheBytes = 0;
+
+    // Phase GraphDrift: subframe override threshold.
+    // If dirty frame count in a group < threshold, upload only dirty frames.
+    // 0 = auto (framesPerGroup / 4, i.e. 25% of frames).
+    uint32_t overrideThreshold = 0;
+
+    // Phase GraphDrift: compaction threshold.
+    // When a group accumulates >= this many overrides, compact back into base.
+    // 0 = disabled.
+    uint32_t compactionThreshold = 8;
+
+    // Phase GraphZenith: journal sequence set by hakuzu before sync.
+    // Written into the manifest so followers know where to replay from.
+    uint64_t journalSeq = 0;
+
+    // Encryption key for pages at rest (local cache + S3).
+    // Empty = no encryption. 32 bytes = AES-256.
+    // CTR mode for local cache (deterministic, page_num as IV).
+    // GCM mode for S3 frames (random nonce, authenticated).
+    std::optional<std::array<uint8_t, 32>> encryptionKey;
 };
 
 // Per-page-group fetch state for async prefetch coordination.
@@ -101,8 +125,11 @@ struct TieredFileInfo : public common::FileInfo {
     enum class TrackMode : uint8_t { NONE, STRUCTURAL, INDEX } trackMode = TrackMode::NONE;
 
     // Pending page groups that need background upload.
+    // Phase GraphDrift: maps group ID to set of dirty local page indices within group.
+    // This allows override detection: if few frames are dirty, upload only those.
     mutable std::mutex pendingMu;
     std::unordered_set<uint64_t> pendingPageGroups;
+    std::unordered_map<uint64_t, std::unordered_set<uint32_t>> pendingDirtyPages;
 
     // Groups already submitted to prefetch pool (dedup for slingshot).
     mutable std::mutex slingshotMu;
@@ -115,9 +142,21 @@ struct TieredFileInfo : public common::FileInfo {
     mutable std::mutex groupCvMu;
     mutable std::condition_variable groupCv;
 
+    // Per-group access tracking for cache eviction.
+    // Parallel arrays indexed by group ID. Only allocated when maxCacheBytes > 0.
+    mutable std::mutex accessMu;
+    std::unique_ptr<std::atomic<uint32_t>[]> groupAccessCounts;  // Capped at 64.
+    std::unique_ptr<std::atomic<uint64_t>[]> groupAccessTimes;   // Monotonic timestamp (ms).
+
+    // Touch a group: update access time and increment count.
+    void touchGroup(uint64_t pgId);
+
     void initGroupStates(uint64_t count);
+    // Grow group arrays (states + access tracking) to cover at least newCount groups.
+    // Called from doSyncFile when writes extend the DB beyond the initial group count.
+    void growGroupArrays(uint64_t newCount, bool trackAccess);
     GroupState getGroupState(uint64_t pgId) const;
-    bool tryClaimGroup(uint64_t pgId);      // CAS NONE→FETCHING, returns true on success.
+    bool tryClaimGroup(uint64_t pgId);      // CAS NONE->FETCHING, returns true on success.
     void markGroupPresent(uint64_t pgId);   // Set PRESENT + notify waiters.
     void markGroupNone(uint64_t pgId);      // Reset to NONE (fetch failed).
     void waitForGroup(uint64_t pgId) const; // Block until PRESENT.
@@ -168,6 +207,20 @@ public:
     // Register the metadata parser. Runs in openFile() after Beacon.
     void setMetadataParser(MetadataParserFn fn);
 
+    // --- Phase GraphZenith: hakuzu integration ---
+
+    // Trigger doSyncFile and return the new manifest version.
+    // Returns 0 if no active file or no dirty pages.
+    uint64_t syncAndGetVersion();
+
+    // Return the current manifest version without syncing.
+    uint64_t getManifestVersion() const;
+
+    // Follower: apply a remote manifest received from the leader.
+    // Parses JSON, compares versions, invalidates cache for changed groups,
+    // sets the new manifest as active. Returns the new version.
+    uint64_t applyRemoteManifest(const std::string& jsonStr);
+
     // Expose S3 client for I/O counters (benchmarking).
     S3Client& s3() { return *s3_; }
 
@@ -199,7 +252,15 @@ public:
 
     // Evict a single page group from the local NVMe cache.
     // Clears bitmap, resets group state, punches hole in cache file (Linux).
-    void evictLocalGroup(uint64_t pageGroupId);
+    void evictLocalGroup(uint64_t pageGroupId) const;
+
+    // Evict groups until cache is under budget. Returns number of groups evicted.
+    // Eviction priority: data first, index under pressure, structural never.
+    // Within a tier, coldest groups (lowest score) evicted first.
+    uint64_t evictToBudget() const;
+
+    // Current cache size in bytes (present pages * page size).
+    uint64_t currentCacheBytes() const;
 
     // Delete stale page group objects from S3 (background GC).
     uint64_t evictStalePageGroups();

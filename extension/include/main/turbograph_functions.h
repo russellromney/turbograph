@@ -38,6 +38,27 @@ struct TurbographConfigGetFunction {
     static function::function_set getFunctionSet();
 };
 
+// Phase GraphZenith: turbograph_sync() -> INT64
+// Triggers doSyncFile and returns the new manifest version.
+struct TurbographSyncFunction {
+    static constexpr const char* name = "turbograph_sync";
+    static function::function_set getFunctionSet();
+};
+
+// Phase GraphZenith: turbograph_get_manifest_version() -> INT64
+// Returns the current manifest version without syncing.
+struct TurbographGetManifestVersionFunction {
+    static constexpr const char* name = "turbograph_get_manifest_version";
+    static function::function_set getFunctionSet();
+};
+
+// Phase GraphZenith: turbograph_set_manifest(json STRING) -> INT64
+// Follower applies a remote manifest. Returns the new version.
+struct TurbographSetManifestFunction {
+    static constexpr const char* name = "turbograph_set_manifest";
+    static function::function_set getFunctionSet();
+};
+
 // Phase Cypher: extract table IDs from a Cypher query's logical plan.
 // Returns (nodeTableIds, relTableIds). Does not execute the query.
 std::pair<std::unordered_set<common::table_id_t>, std::unordered_set<common::table_id_t>>

@@ -2,136 +2,10 @@
 
 Completed work is in CHANGELOG.md.
 
-## Phase Extension: LadybugDB Extension Integration
-> Before: Phase Volley (catalog)
-
-Build turbograph as a proper LadybugDB extension. This unlocks UDFs, catalog
-access, and query plan hooks that the VFS can't do standalone.
-
-### a. Extension wrapper
-- [ ] Create `extension/turbograph/` in ladybug-fork
-- [ ] Register TieredFileSystem via LadybugDB's VirtualFileSystem
-- [ ] Link turbograph static library + liblbug
-
-### b. turbograph_config_set UDF
-- [ ] Register scalar function: `CALL turbograph_config_set(key, value)`
-- [ ] Keys: `prefetch` (set active schedule), `prefetch_scan`, `prefetch_lookup`
-- [ ] UDF holds pointer to TieredFileSystem, calls setActiveSchedule/setSchedule
-- [ ] Per-connection: each Connection gets its own schedule state
-
-### c. turbograph_info UDF
-- [ ] `CALL turbograph_info()` returns current config, cache stats, S3 fetch count
-- [ ] Useful for debugging and benchmarking
-
----
-
-## Phase Volley (catalog): Per-Table Prefetch Schedules
-> After: Phase Extension · Before: Phase Cypher
-
-With extension access to the catalog, parse table metadata to build a
-page-to-table mapping. Select prefetch schedule automatically based on
-which table a page belongs to.
-
-### a. Catalog parse for page-to-table mapping
-- [ ] During `openFile()`, use Kuzu's Deserializer to parse metadata pages
-- [ ] Extract per-table column PageRanges (node groups, CSR columns, indexes)
-- [ ] Build sorted interval map: page number -> (table_id, table_type)
-- [ ] Store on TieredFileInfo alongside manifest
-
-### b. Per-table miss counters
-- [ ] Replace global `consecutiveMisses` with `HashMap<table_id, uint8_t>`
-- [ ] On cache miss, look up page's table, increment that table's counter
-- [ ] Reset counter on cache hit for that table
-- [ ] Auto-select schedule: relationship tables -> scan, node tables -> lookup
-
-### c. Measure impact
-- [ ] Run with 1M persons (~250MB, multiple page groups per table)
-- [ ] Expected: multi-table joins no longer over-prefetch from cross-table miss escalation
-
----
-
-## Phase Cypher: Query Plan Frontrunning
-> After: Phase Volley · Before: Phase Vault
-
-Parse Kuzu's query plan before execution to prefetch tables proactively.
-
-### a. EXPLAIN integration
-- [ ] Before executing a query, run `EXPLAIN` on the Cypher statement
-- [ ] Parse physical plan for operator types: SCAN, INDEX_LOOKUP, HASH_JOIN, EXTEND
-- [ ] Map operators to table page group ranges via catalog metadata
-
-### b. Proactive dispatch
-- [ ] SCAN: submit ALL page groups for that table before first page read
-- [ ] INDEX_LOOKUP: prefetch index page groups only
-- [ ] Multi-table joins: submit all tables' groups in parallel
-- [ ] Hook into Connection::query() or provide prepareAndPrefetch() API
-
-### c. Fallback
-- [ ] If EXPLAIN fails, fall back to per-table reactive schedules (Phase Volley)
-
----
-
-## Phase Vault: Page-Level Encryption and Compression on Disk
-> After: Phase Cypher · Before: Phase Column
-
-Encrypt pages at rest on local NVMe cache and in S3. Same architecture as
-turbolite: CTR for cache (fast, no overhead), GCM for S3 (authenticated).
-Compress then encrypt for S3. OpenSSL provides both ciphers (already linked).
-
-### a. Crypto primitives
-- [ ] Add `encryption_key: std::optional<std::array<uint8_t, 32>>` to `TieredConfig`
-- [ ] Implement `aes256_ctr_encrypt(data, page_num, key)` / `aes256_ctr_decrypt(data, page_num, key)`
-  - IV = page_num as 8-byte LE, zero-padded to 16 bytes
-  - No size overhead (ciphertext = plaintext)
-  - OpenSSL `EVP_aes_256_ctr`
-- [ ] Implement `aes256_gcm_encrypt(data, key)` / `aes256_gcm_decrypt(data, key)`
-  - Random 12-byte nonce, prepended to ciphertext
-  - 16-byte auth tag appended
-  - 28 bytes overhead per frame (nonce + tag)
-  - OpenSSL `EVP_aes_256_gcm`
-- [ ] Put these in `crypto.cpp` / `crypto.h`
-- [ ] Tests: round-trip, wrong key fails, deterministic CTR nonce, GCM auth rejection
-
-### b. Local cache encryption (CTR)
-- [ ] In `readOnePage`: after `pread`, CTR decrypt if key is set
-- [ ] In `writeOnePage` (dirty page flush to cache): CTR encrypt before `pwrite`
-- [ ] In `fetchAndStoreGroup` (S3 -> cache): CTR encrypt each page before `pwrite`
-- [ ] Cache hit path: `pread` -> CTR decrypt -> return plaintext
-- [ ] Zero size overhead: page offsets and bitmap unchanged
-- [ ] Tests: write encrypted, read decrypted, wrong key returns garbage
-
-### c. S3 encryption (GCM)
-- [ ] In `flushPendingPageGroups` (encode path): after zstd compress, GCM encrypt each frame
-  - Seekable encoding: per-frame GCM (each frame gets own random nonce)
-  - Legacy encoding: single GCM wrap around whole compressed blob
-- [ ] In `fetchAndStoreGroup` (decode path): GCM decrypt before zstd decompress
-- [ ] In `fetchAndStoreFrame` (range GET path): GCM decrypt the individual frame
-- [ ] Update `FrameEntry.len` in manifest to include 28-byte GCM overhead
-- [ ] Tests: round-trip via S3, tampered blob rejected, manifest frame offsets correct
-
-### d. Key management
-- [ ] Key set via `TieredConfig` (application provides the 32 bytes)
-- [ ] Env var support: `TURBOGRAPH_ENCRYPTION_KEY` (hex-encoded 64 chars)
-- [ ] Extension option: `turbograph_encryption_key` (confidential STRING, hex)
-- [ ] Key is per-database, same for all pages and S3 objects
-- [ ] Key never stored on disk. Provided at runtime via env var or extension option.
-- [ ] Manifest records `"encrypted": true` flag (not the key). Opening an encrypted
-  database without a key gives a clear error instead of a cryptic GCM auth failure.
-- [ ] No key rotation in MVP (future: re-download, re-encrypt, re-upload all objects)
-
-### e. Compression dictionary (future)
-- [ ] Train zstd dictionary on first checkpoint's page data
-- [ ] Store dictionary in manifest (or as separate S3 object)
-- [ ] Pass dictionary to zstd compress/decompress in encode/decode paths
-- [ ] 2-5x better compression on structured columnar data
-
----
-
 ## Phase Glacier: Automatic Cache Eviction
-> After: Phase Vault · Before: Phase Column
+> Before: Phase GraphDrift
 
-Today the cache grows unbounded. For production (shared volumes, multi-tenant),
-the cache needs a size limit and automatic eviction under pressure.
+Production requirement for multi-tenant. Without size limits, turbograph eats all NVMe.
 
 ### a. Cache size limit
 - [ ] Add `maxCacheBytes` to `TieredConfig` (0 = unlimited, default)
@@ -157,41 +31,70 @@ the cache needs a size limit and automatic eviction under pressure.
 
 ---
 
-## Phase Orbit: hakuzu Replication Integration
-> After: Phase Glacier · Before: Phase Apex
+## Phase GraphDrift: Subframe Overrides
+> After: Phase Glacier . Before: Phase GraphZenith
 
-Wire hakuzu (which owns graphstream) so turbograph's checkpoint doubles as
-the replication snapshot. hakuzu has two modes: HA (leader election, write
-forwarding, failover) and standalone (single writer, journal shipping to S3,
-restore, read replicas, no lease management). One codebase, one config flag.
+Without overrides, every checkpoint uploads ~16MB per dirty group. Port of turbolite's Phase Drift. Prerequisite for S3Primary mode.
 
-### a. Checkpoint as snapshot
-- [ ] On checkpoint (doSyncFile), after flushing page groups to S3, update manifest
-- [ ] Manifest version is the replication cursor for hakuzu
-- [ ] No separate full-DB snapshot needed: page groups *are* the snapshot
+### a. Manifest + override tracking
+- [ ] Add `subframeOverrides` to `Manifest` struct: `map<groupId, map<frameIndex, OverrideInfo>>` where `OverrideInfo = {key, frameEntry}`
+- [ ] Same schema as turbolite's `SubframeOverride`
+- [ ] Backward-compatible JSON (missing field = no overrides)
 
-### b. hakuzu standalone mode
-- [ ] Config flag: `ha: false` (default) skips lease management and write forwarding
-- [ ] Still does journal shipping via graphstream + checkpoint to S3
-- [ ] Restore from S3: fetch manifest + page groups, replay journal segments
-- [ ] Read replicas: poll S3 for new journal segments, apply incrementally
+### b. Override write path
+- [ ] In sync path: when a group has fewer dirty frames than threshold (default: pagesPerGroup/4), upload individual override objects instead of full group
+- [ ] Override key format: `pg/{gid}_f{frameIdx}_v{version}` (same as turbolite)
+- [ ] GC: old override keys collected alongside old base group keys
 
-### c. hakuzu HA mode
-- [ ] Config flag: `ha: true` enables leader election via LeaseStore
-- [ ] On promotion: replica catches up journal, takes lease, becomes writer
-- [ ] On demotion: writer stops, releases lease, becomes replica
-- [ ] Write forwarding: followers forward writes to leader
+### c. Override read path
+- [ ] When loading a group, check overrides per frame
+- [ ] Fetch from override key instead of base group range GET when override exists
+- [ ] Prefetch pool carries overrides per job, applies after base group fetch
 
-### d. turbograph's role
-- [ ] turbograph is unaware of replication or HA
-- [ ] It just reads/writes via the VFS, checkpoints to S3
-- [ ] hakuzu wraps turbograph + LadybugDB, coordinates replication
+### d. Auto-compaction
+- [ ] When override count exceeds threshold (default: 8), merge into fresh base group
+- [ ] `compactOverrideGroup()`: fetch base + overrides, merge, re-encode, upload
+- [ ] Compaction fires at end of sync, or via explicit call
 
 ### e. Tests
-- [ ] Unit: manifest version advances on checkpoint
-- [ ] Integration (standalone): write, checkpoint, restore from S3 on fresh node
-- [ ] Integration (standalone): writer + read replica, replica sees new data
-- [ ] Integration (HA): leader crash, follower promotes, serves queries
+- [ ] Write single page, verify only sub-frame uploaded
+- [ ] Cold read with overrides
+- [ ] Override then full rewrite, cold read correct
+- [ ] Compaction fires at threshold
+- [ ] Manifest round-trip with overrides (JSON backward compat)
+
+---
+
+## Phase GraphZenith: S3Primary Mode
+> After: Phase GraphDrift . Before: Phase Apex
+
+Every graph write durable in S3. RPO=0 for graph databases. Port of turbolite's Phase Zenith.
+
+### a. S3Primary sync path
+- [ ] On every `syncFile()`, upload dirty frames as overrides + publish manifest to S3
+- [ ] Manifest publish IS the atomic commit point
+- [ ] No local journal needed for durability (S3 has everything)
+
+### b. UDFs for hakuzu integration
+- [ ] `turbograph_sync()`: triggers checkpoint, returns new manifest version
+- [ ] `turbograph_get_manifest_version()`: cheap version check (no full manifest fetch)
+- [ ] `turbograph_set_manifest(json)`: follower applies remote manifest, invalidates stale cache entries
+
+### c. Journal sequence coordination
+- [ ] Manifest includes `journal_seq` field (graphstream position captured at checkpoint)
+- [ ] hakuzu writes current graphstream sequence before calling `turbograph_sync()`
+- [ ] On follower restore: load manifest, apply turbograph pages, set graphstream replay to `journal_seq`
+
+### d. Cache validation on open
+- [ ] On open: fetch S3 manifest, compare with local
+- [ ] Version match: cache warm. Mismatch: diff manifests, invalidate changed groups
+- [ ] Crash recovery (local ahead of S3): discard local, full cache invalidation
+
+### e. Tests
+- [ ] Write, checkpoint, kill, restore from S3 on fresh node
+- [ ] Verify data integrity + journal position
+- [ ] RPO=0 under SIGKILL
+- [ ] Cache validation after external writer
 
 ---
 
@@ -221,6 +124,18 @@ Only pursue if benchmarks show page group misses are the bottleneck.
 - Each frame gets its own atomic state
 - Eliminates slingshot's "keep group FETCHING" workaround
 - frameStates array: totalGroups * framesPerGroup entries
+
+### Encryption key rotation
+- Download each page group, GCM decrypt with old key, re-encrypt with new key, re-upload
+- Atomic manifest update with new version
+- GC old S3 objects after rotation
+- Same pattern as turbolite's `rotate_encryption_key()`
+
+### Compression dictionary
+- Train zstd dictionary on first checkpoint's page data
+- Store dictionary in manifest (or as separate S3 object)
+- Pass dictionary to zstd compress/decompress in encode/decode paths
+- 2-5x better compression on structured columnar data
 
 ### turbograph-tune CLI
 - Sweep schedule grid against real queries

@@ -2,6 +2,7 @@
 
 #include "common/types/types.h"
 #include "common/types/value/value.h"
+#include "crypto.h"
 #include "main/client_context.h"
 #include "main/database.h"
 #include "main/turbograph_functions.h"
@@ -58,6 +59,10 @@ static void registerExtensionOptions(main::Database* db) {
         common::Value{std::string("")});
     db->addExtensionOption("turbograph_cache_dir", common::LogicalTypeID::STRING,
         common::Value{std::string("")});
+
+    // Encryption key (hex-encoded 64-char string, confidential).
+    db->addExtensionOption("turbograph_encryption_key", common::LogicalTypeID::STRING,
+        common::Value{std::string("")}, true);
 }
 
 void TurbographExtension::load(main::ClientContext* context) {
@@ -77,6 +82,23 @@ void TurbographExtension::load(main::ClientContext* context) {
         if (ak) cfg.s3.accessKey = ak;
         if (sk) cfg.s3.secretKey = sk;
         if (ep) cfg.s3.endpoint = ep;
+    }
+
+    // Parse encryption key from env var or extension option.
+    std::string encKeyStr;
+    try {
+        encKeyStr = context->getCurrentSetting("turbograph_encryption_key")
+            .getValue<std::string>();
+    } catch (...) {}
+    if (encKeyStr.empty()) {
+        auto envKey = std::getenv("TURBOGRAPH_ENCRYPTION_KEY");
+        if (envKey) encKeyStr = envKey;
+    }
+    if (!encKeyStr.empty()) {
+        auto key = tiered::parse_hex_key(encKeyStr);
+        if (key) {
+            cfg.encryptionKey = *key;
+        }
     }
 
     // Only register the TieredFileSystem if we have S3 credentials + data file path.
@@ -101,6 +123,11 @@ void TurbographExtension::load(main::ClientContext* context) {
     // Register UDFs.
     extension::ExtensionUtils::addScalarFunc<TurbographConfigSetFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographConfigGetFunction>(*db);
+
+    // Phase GraphZenith: hakuzu integration UDFs.
+    extension::ExtensionUtils::addScalarFunc<TurbographSyncFunction>(*db);
+    extension::ExtensionUtils::addScalarFunc<TurbographGetManifestVersionFunction>(*db);
+    extension::ExtensionUtils::addScalarFunc<TurbographSetManifestFunction>(*db);
 }
 
 } // namespace turbograph_extension

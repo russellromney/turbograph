@@ -1,5 +1,64 @@
 # Changelog
 
+## Phase Vault -- 2026-04-02
+
+Page-level encryption at rest. CTR mode for local NVMe cache (zero overhead,
+deterministic), GCM mode for S3 frames (authenticated, random nonce).
+
+- `crypto.h`/`crypto.cpp`: AES-256-CTR and AES-256-GCM via OpenSSL EVP
+- `TieredConfig::encryptionKey`: optional 32-byte key enables encryption
+- Local cache: CTR encrypt on pwrite, CTR decrypt on pread (page_num as IV)
+- S3 frames: GCM encrypt after zstd compression, GCM decrypt before decompression
+- Per-frame GCM: each seekable frame gets its own random 12-byte nonce
+- Manifest `encrypted` flag: opening encrypted DB without key gives clear error
+- Key via env var `TURBOGRAPH_ENCRYPTION_KEY` (hex) or extension option
+- `parse_hex_key()`: 64-char hex string to 32-byte key
+- 14 crypto unit tests (CTR round-trip, deterministic IV, wrong key, GCM auth
+  rejection, tampered data, empty payload, 1MB payload, hex parsing)
+- 3 VFS integration tests (encrypted write-sync-read, wrong key reads garbage,
+  manifest flag serialization)
+
+## Phase Cypher -- 2026-04-01
+
+Query plan frontrunning. Before query execution, walk the logical plan to
+proactively prefetch all tables the query will touch.
+
+- `extractTablesFromPlan()` walks logical plan tree for SCAN_NODE_TABLE + EXTEND operators
+- Collects both node table IDs and relationship table IDs (including neighbor nodes)
+- `prefetchTables()` converts table IDs to page group ranges, submits to prefetch pool
+- Handles prepare failures gracefully (returns empty sets, falls back to reactive)
+- Tests: node scan returns node IDs, edge traversal returns both, multi-table join
+  returns all tables, invalid Cypher returns empty (no crash)
+
+## Phase Volley (catalog) -- 2026-04-01
+
+Per-table prefetch schedules. Parse metadata to build page-to-table mapping,
+auto-select prefetch schedule based on table type.
+
+- `TablePageMap`: sorted interval map with O(log n) binary search lookup
+- `TableMissCounters`: lock-free per-table atomic miss counters
+- `table_map_builder.cpp`: raw metadata parser using Kuzu's Deserializer, walks
+  StorageManager binary format to extract PageRanges from all table types
+- Per-table schedule selection in readOnePage: relationship tables get scan (aggressive),
+  node tables get lookup (conservative)
+- Cache hit resets per-table counter to prevent stale escalation
+- `buildTablePageMap()` UDF path for manual rebuild after data changes
+- 24 unit tests (data structures) + 3 extension integration tests
+
+## Phase Extension -- 2026-04-01
+
+LadybugDB extension integration. VFS, UDFs, metadata parser, and plan prefetch
+work against upstream LadybugDB (no fork needed).
+
+- TieredFileSystem registered via LadybugDB's VirtualFileSystem
+- `turbograph_config_set(key, value)` UDF: switch prefetch schedules, manage table map
+- `turbograph_config_get(key)` UDF: query prefetch state, S3 fetch counters
+- Metadata parser callback wired into `openFile()` for per-table schedule selection
+- Plan prefetch via `extractTablesFromPlan()` for proactive table fetching
+- `make test-extension` target: builds and runs 8 extension tests against LadybugDB
+- Tests: no-credentials load, UDF registration, unknown key error, config round-trip,
+  bad float parsing, S3 counter reads, TFS state mutation, custom schedule override
+
 ## Phase Volley (VFS side) -- 2026-03-31
 
 Named prefetch schedules with per-query switching.

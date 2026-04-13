@@ -1,4 +1,5 @@
 #include "tiered_file_system.h"
+#include "crypto.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -116,11 +117,78 @@ void TieredFileInfo::waitForGroup(uint64_t pgId) const {
     });
 }
 
+void TieredFileInfo::growGroupArrays(uint64_t newCount, bool trackAccess) {
+    if (newCount <= totalGroups) return;
+
+    // Lock accessMu to prevent evictToBudget from iterating stale array pointers
+    // while we reallocate. touchGroup() is safe without this lock since it only
+    // accesses individual atomic elements, not the array pointer itself.
+    std::lock_guard<std::mutex> lock(accessMu);
+
+    // Re-check under lock (another thread may have grown arrays already).
+    if (newCount <= totalGroups) return;
+
+    // Allocate new arrays, copy old data, zero-init new entries.
+    auto newStates = std::make_unique<std::atomic<uint8_t>[]>(newCount);
+    for (uint64_t i = 0; i < totalGroups; i++) {
+        newStates[i].store(
+            groupStates ? groupStates[i].load(std::memory_order_relaxed) :
+            static_cast<uint8_t>(GroupState::NONE),
+            std::memory_order_relaxed);
+    }
+    for (uint64_t i = totalGroups; i < newCount; i++) {
+        newStates[i].store(static_cast<uint8_t>(GroupState::NONE),
+            std::memory_order_relaxed);
+    }
+    groupStates = std::move(newStates);
+
+    if (trackAccess) {
+        auto newCounts = std::make_unique<std::atomic<uint32_t>[]>(newCount);
+        auto newTimes = std::make_unique<std::atomic<uint64_t>[]>(newCount);
+        for (uint64_t i = 0; i < totalGroups; i++) {
+            newCounts[i].store(
+                groupAccessCounts ? groupAccessCounts[i].load(std::memory_order_relaxed) : 0,
+                std::memory_order_relaxed);
+            newTimes[i].store(
+                groupAccessTimes ? groupAccessTimes[i].load(std::memory_order_relaxed) : 0,
+                std::memory_order_relaxed);
+        }
+        for (uint64_t i = totalGroups; i < newCount; i++) {
+            newCounts[i].store(0, std::memory_order_relaxed);
+            newTimes[i].store(0, std::memory_order_relaxed);
+        }
+        groupAccessCounts = std::move(newCounts);
+        groupAccessTimes = std::move(newTimes);
+    }
+
+    totalGroups = newCount;
+}
+
 void TieredFileInfo::resetGroupStates() {
     if (!groupStates) return;
     for (uint64_t i = 0; i < totalGroups; i++) {
         groupStates[i].store(static_cast<uint8_t>(GroupState::NONE),
             std::memory_order_relaxed);
+    }
+}
+
+static uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void TieredFileInfo::touchGroup(uint64_t pgId) {
+    if (!groupAccessTimes || pgId >= totalGroups) return;
+    groupAccessTimes[pgId].store(nowMs(), std::memory_order_release);
+    // CAS loop for atomic increment with saturation at 64.
+    uint32_t old = groupAccessCounts[pgId].load(std::memory_order_relaxed);
+    while (old < 64) {
+        if (groupAccessCounts[pgId].compare_exchange_weak(
+                old, old + 1, std::memory_order_release)) {
+            break;
+        }
+        // old is updated by compare_exchange_weak on failure.
     }
 }
 
@@ -333,32 +401,74 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
     std::filesystem::create_directories(config_.cacheDir);
 
     // 1. Load manifest: disk first, then S3 fallback.
+    //    Phase GraphZenith: if local manifest exists, compare against S3 to
+    //    detect stale cache (S3 newer) or crash recovery (local "newer").
     Manifest m;
     bool manifestFound = false;
+    bool needCacheInvalidation = false;
+    Manifest localManifest;
+    bool hasLocalManifest = false;
+
     if (std::filesystem::exists(manifestPath)) {
         std::ifstream f(manifestPath, std::ios::binary);
         std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         auto parsed = Manifest::fromJSON(json);
         if (parsed.has_value()) {
-            m = *parsed;
-            manifestFound = true;
+            localManifest = *parsed;
+            hasLocalManifest = true;
         }
     }
-    if (!manifestFound) {
-        auto s3Manifest = s3_->getManifest();
-        if (s3Manifest.has_value()) {
+
+    // Always check S3 for the authoritative manifest.
+    auto s3Manifest = s3_->getManifest();
+
+    if (hasLocalManifest && s3Manifest.has_value()) {
+        // Both exist: compare versions.
+        if (localManifest.version == s3Manifest->version) {
+            // Versions match: cache is warm.
+            m = localManifest;
+            manifestFound = true;
+        } else if (s3Manifest->version > localManifest.version) {
+            // S3 is newer: use S3 manifest, invalidate changed groups.
             m = *s3Manifest;
             manifestFound = true;
-            std::ofstream f(manifestPath, std::ios::binary | std::ios::trunc);
-            auto json = m.toJSON();
-            f.write(json.data(), json.size());
+            needCacheInvalidation = true;
         } else {
-            m.pageSize = config_.pageSize;
-            m.pagesPerGroup = config_.pagesPerGroup;
+            // Local is "newer" (crash during write, manifest never published).
+            // Discard local, use S3, full cache invalidation.
+            m = *s3Manifest;
+            manifestFound = true;
+            needCacheInvalidation = true;
         }
+    } else if (hasLocalManifest && !s3Manifest.has_value()) {
+        // Only local exists (e.g. fresh upload not yet committed, or offline).
+        m = localManifest;
+        manifestFound = true;
+    } else if (!hasLocalManifest && s3Manifest.has_value()) {
+        // Only S3 exists: cold open.
+        m = *s3Manifest;
+        manifestFound = true;
+    } else {
+        // Neither exists: new database.
+        m.pageSize = config_.pageSize;
+        m.pagesPerGroup = config_.pagesPerGroup;
+    }
+
+    // Persist the manifest locally if we used S3.
+    if (manifestFound && (!hasLocalManifest || needCacheInvalidation)) {
+        std::ofstream f(manifestPath, std::ios::binary | std::ios::trunc);
+        auto json = m.toJSON();
+        f.write(json.data(), json.size());
     }
     if (m.pageSize == 0) m.pageSize = config_.pageSize;
     if (m.pagesPerGroup == 0) m.pagesPerGroup = config_.pagesPerGroup;
+
+    // Reject encrypted database opened without a key.
+    if (m.encrypted && !config_.encryptionKey) {
+        throw common::InternalException(
+            "Database is encrypted but no encryption key was provided. "
+            "Set TURBOGRAPH_ENCRYPTION_KEY or turbograph_encryption_key option.");
+    }
 
     if (m.pageSize != config_.pageSize) {
         throw std::runtime_error(
@@ -403,9 +513,77 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
     if (m.pageCount > 0) {
         auto totalGroups = (m.pageCount + m.pagesPerGroup - 1) / m.pagesPerGroup;
         info->initGroupStates(totalGroups);
+
+        // Initialize access tracking arrays for cache eviction.
+        if (config_.maxCacheBytes > 0) {
+            info->groupAccessCounts = std::make_unique<std::atomic<uint32_t>[]>(totalGroups);
+            info->groupAccessTimes = std::make_unique<std::atomic<uint64_t>[]>(totalGroups);
+            for (uint64_t i = 0; i < totalGroups; i++) {
+                info->groupAccessCounts[i].store(0, std::memory_order_relaxed);
+                info->groupAccessTimes[i].store(0, std::memory_order_relaxed);
+            }
+        }
     }
 
     activeFileInfo_.store(info.get());
+
+    // Phase GraphZenith: cache invalidation when S3 manifest is newer or local is stale.
+    if (needCacheInvalidation && hasLocalManifest && m.pageCount > 0) {
+        if (localManifest.version > m.version) {
+            // Local "newer" (crash recovery): full invalidation.
+            info->bitmap->clear();
+            info->resetGroupStates();
+        } else {
+            // S3 is newer: diff manifests, invalidate changed groups.
+            auto maxGroups = std::max(localManifest.pageGroupKeys.size(),
+                                      m.pageGroupKeys.size());
+            for (size_t gid = 0; gid < maxGroups; gid++) {
+                bool changed = false;
+                auto oldKey = gid < localManifest.pageGroupKeys.size()
+                    ? localManifest.pageGroupKeys[gid] : std::string{};
+                auto newKey = gid < m.pageGroupKeys.size()
+                    ? m.pageGroupKeys[gid] : std::string{};
+                if (oldKey != newKey) changed = true;
+
+                if (!changed) {
+                    bool oldHas = gid < localManifest.subframeOverrides.size() &&
+                        !localManifest.subframeOverrides[gid].empty();
+                    bool newHas = gid < m.subframeOverrides.size() &&
+                        !m.subframeOverrides[gid].empty();
+                    if (oldHas != newHas) {
+                        changed = true;
+                    } else if (oldHas && newHas) {
+                        auto& ov1 = localManifest.subframeOverrides[gid];
+                        auto& ov2 = m.subframeOverrides[gid];
+                        if (ov1.size() != ov2.size()) {
+                            changed = true;
+                        } else {
+                            for (auto& [idx, ov] : ov1) {
+                                auto it = ov2.find(idx);
+                                if (it == ov2.end() || it->second.key != ov.key ||
+                                    it->second.entry.offset != ov.entry.offset ||
+                                    it->second.entry.len != ov.entry.len) {
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (changed) {
+                    auto startPage = static_cast<uint64_t>(gid) * m.pagesPerGroup;
+                    auto endPage = std::min(startPage + m.pagesPerGroup, m.pageCount);
+                    if (endPage > startPage) {
+                        info->bitmap->clearRange(startPage, endPage - startPage);
+                    }
+                    if (gid < info->totalGroups) {
+                        info->markGroupNone(gid);
+                    }
+                }
+            }
+        }
+    }
 
     // --- Phase Beacon: Eager-fetch structural pages ---
     // Fetch page 0 to check for Kuzu magic bytes. If valid, parse the database
@@ -640,7 +818,7 @@ void TieredFileSystem::clearCacheKeepIndex() {
     }
 }
 
-void TieredFileSystem::evictLocalGroup(uint64_t pageGroupId) {
+void TieredFileSystem::evictLocalGroup(uint64_t pageGroupId) const {
     auto* afi = activeFileInfo_.load();
     if (!afi) return;
     auto& ti = *afi;
@@ -658,6 +836,136 @@ void TieredFileSystem::evictLocalGroup(uint64_t pageGroupId) {
     auto len = static_cast<off_t>(ti.pagesPerGroup * ti.pageSize);
     ::fallocate(ti.localFd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
 #endif
+
+    // 4. Reset access tracking for this group.
+    if (ti.groupAccessCounts && pageGroupId < ti.totalGroups) {
+        ti.groupAccessCounts[pageGroupId].store(0, std::memory_order_relaxed);
+        ti.groupAccessTimes[pageGroupId].store(0, std::memory_order_relaxed);
+    }
+}
+
+uint64_t TieredFileSystem::currentCacheBytes() const {
+    auto* afi = activeFileInfo_.load();
+    if (!afi || !afi->bitmap) return 0;
+    return afi->bitmap->presentCount() * afi->pageSize;
+}
+
+uint64_t TieredFileSystem::evictToBudget() const {
+    if (config_.maxCacheBytes == 0) return 0;
+
+    auto* afi = activeFileInfo_.load();
+    if (!afi || !afi->bitmap) return 0;
+    auto& ti = *afi;
+
+    uint64_t cacheBytes = ti.bitmap->presentCount() * ti.pageSize;
+    if (cacheBytes <= config_.maxCacheBytes) return 0;
+
+    // Target: evict to 80% of limit to avoid thrashing.
+    // Reordered to avoid overflow for very large maxCacheBytes values.
+    uint64_t target = config_.maxCacheBytes - config_.maxCacheBytes / 5;
+    uint64_t now = nowMs();
+    constexpr uint64_t RECENCY_WINDOW_MS = 3600 * 1000; // 1 hour.
+
+    // Snapshot access array pointers under accessMu to prevent use-after-free
+    // if growGroupArrays() reallocates while we iterate.
+    std::atomic<uint32_t>* accessCountsSnap = nullptr;
+    std::atomic<uint64_t>* accessTimesSnap = nullptr;
+    uint64_t snapTotalGroups = 0;
+    {
+        std::lock_guard<std::mutex> lock(ti.accessMu);
+        accessCountsSnap = ti.groupAccessCounts.get();
+        accessTimesSnap = ti.groupAccessTimes.get();
+        snapTotalGroups = ti.totalGroups;
+    }
+
+    // Eviction tier for a group. 0 = data (evict first), 1 = index, 2 = structural (never).
+    auto groupTier = [&](uint64_t gid) -> int {
+        auto startPage = gid * ti.pagesPerGroup;
+        auto endPage = std::min(startPage + ti.pagesPerGroup,
+            ti.bitmap->pageCount());
+        bool hasStructural = false;
+        bool hasIndex = false;
+        for (auto p = startPage; p < endPage; p++) {
+            if (ti.structuralPages && ti.structuralPages->isPresent(p)) {
+                hasStructural = true;
+                break;
+            }
+            if (ti.indexPages && ti.indexPages->isPresent(p)) {
+                hasIndex = true;
+            }
+        }
+        if (hasStructural) return 2;
+        if (hasIndex) return 1;
+        return 0;
+    };
+
+    // Score each PRESENT group. Lower score = evict first.
+    // Score = tier_bonus (0/10/inf) + recency (0-1) + frequency (0-1).
+    struct ScoredGroup {
+        uint64_t gid;
+        float score;
+    };
+    std::vector<ScoredGroup> candidates;
+
+    // Derive effective group count from bitmap (source of truth for cached pages).
+    // totalGroups is set at open time and may be 0 if the DB started empty.
+    auto bitmapPages = ti.bitmap->pageCount();
+    uint64_t effectiveGroups = (bitmapPages + ti.pagesPerGroup - 1) / ti.pagesPerGroup;
+    if (snapTotalGroups > effectiveGroups) effectiveGroups = snapTotalGroups;
+
+    for (uint64_t gid = 0; gid < effectiveGroups; gid++) {
+        // A group is cached if any of its pages are in the bitmap.
+        auto startPage = gid * ti.pagesPerGroup;
+        bool hasCachedPages = false;
+        for (uint32_t p = 0; p < ti.pagesPerGroup; p++) {
+            if (ti.bitmap->isPresent(startPage + p)) {
+                hasCachedPages = true;
+                break;
+            }
+        }
+        if (!hasCachedPages) continue;
+
+        // Skip groups currently being fetched by background workers.
+        if (gid < snapTotalGroups && ti.getGroupState(gid) == GroupState::FETCHING) continue;
+
+        int tier = groupTier(gid);
+        if (tier == 2) continue; // Never evict structural.
+
+        float tierBonus = (tier == 1) ? 10.0f : 0.0f;
+
+        float recency = 0.0f;
+        float frequency = 0.0f;
+        if (accessTimesSnap && accessCountsSnap && gid < snapTotalGroups) {
+            uint64_t lastAccess = accessTimesSnap[gid].load(std::memory_order_acquire);
+            if (lastAccess > 0 && now > lastAccess) {
+                uint64_t ageMs = now - lastAccess;
+                recency = 1.0f - std::min(1.0f,
+                    static_cast<float>(ageMs) / RECENCY_WINDOW_MS);
+            }
+            uint32_t count = accessCountsSnap[gid].load(std::memory_order_acquire);
+            frequency = std::min(1.0f, static_cast<float>(count) / 64.0f);
+        }
+
+        candidates.push_back({gid, tierBonus + recency + frequency});
+    }
+
+    // Sort by score ascending (coldest first).
+    std::sort(candidates.begin(), candidates.end(),
+        [](const ScoredGroup& a, const ScoredGroup& b) {
+            return a.score < b.score;
+        });
+
+    // Evict until under target.
+    uint64_t evicted = 0;
+    uint64_t groupBytes = static_cast<uint64_t>(ti.pagesPerGroup) * ti.pageSize;
+    for (auto& c : candidates) {
+        if (cacheBytes <= target) break;
+        evictLocalGroup(c.gid);
+        cacheBytes = (cacheBytes > groupBytes) ? cacheBytes - groupBytes : 0;
+        evicted++;
+    }
+
+    return evicted;
 }
 
 // --- fetchAndStoreFrame: fetch a single seekable frame via range GET ---
@@ -669,6 +977,9 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
     std::string pgKey;
     std::vector<FrameEntry> frameTable;
     uint32_t subPPF = 0;
+    std::string overrideKey;
+    FrameEntry overrideEntry;
+    bool hasOverride = false;
     {
         std::lock_guard lock(ti.manifestMu);
         if (pageGroupId >= ti.manifest.pageGroupKeys.size()) return false;
@@ -677,14 +988,36 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
             frameTable = ti.manifest.frameTables[pageGroupId];
         }
         subPPF = ti.manifest.subPagesPerFrame;
+
+        // Phase GraphDrift: check for subframe override.
+        if (pageGroupId < ti.manifest.subframeOverrides.size()) {
+            auto& ovMap = ti.manifest.subframeOverrides[pageGroupId];
+            auto it = ovMap.find(static_cast<size_t>(frameIdx));
+            if (it != ovMap.end()) {
+                overrideKey = it->second.key;
+                overrideEntry = it->second.entry;
+                hasOverride = true;
+            }
+        }
     }
-    if (pgKey.empty() || frameIdx >= frameTable.size() || subPPF == 0) return false;
 
-    auto& entry = frameTable[frameIdx];
-    if (entry.len == 0) return false;
+    FrameEntry entry;
+    std::optional<std::vector<uint8_t>> compressedFrame;
 
-    auto compressedFrame = ti.s3->getObjectRange(pgKey, entry.offset, entry.len);
-    if (!compressedFrame.has_value()) return false;
+    if (hasOverride && !overrideKey.empty() && overrideEntry.len > 0) {
+        // Phase GraphDrift: fetch override object (full GET, not range GET).
+        compressedFrame = ti.s3->getObject(overrideKey);
+        if (!compressedFrame.has_value()) return false;
+        entry = overrideEntry;
+        entry.offset = 0; // Override objects are standalone.
+    } else {
+        // Normal path: range GET from base group.
+        if (pgKey.empty() || frameIdx >= frameTable.size() || subPPF == 0) return false;
+        entry = frameTable[frameIdx];
+        if (entry.len == 0) return false;
+        compressedFrame = ti.s3->getObjectRange(pgKey, entry.offset, entry.len);
+        if (!compressedFrame.has_value()) return false;
+    }
 
     // Validate we got the expected number of bytes.
     if (compressedFrame->size() != entry.len) return false;
@@ -694,7 +1027,17 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
     auto frameStartLocal = frameIdx * subPPF;
     uint32_t pagesInFrame = entry.pageCount > 0 ? entry.pageCount : subPPF;
 
-    auto rawFrame = decodeFrame(*compressedFrame, pagesInFrame, ti.pageSize);
+    // GCM decrypt the frame if encrypted.
+    std::vector<uint8_t> frameData;
+    if (config_.encryptionKey) {
+        frameData = aes256_gcm_decrypt(compressedFrame->data(),
+            compressedFrame->size(), *config_.encryptionKey);
+        if (frameData.empty()) return false; // Auth failure.
+    } else {
+        frameData = std::move(*compressedFrame);
+    }
+
+    auto rawFrame = decodeFrame(frameData, pagesInFrame, ti.pageSize);
 
     // Write each page in the frame to local file.
     for (uint32_t i = 0; i < pagesInFrame; i++) {
@@ -704,9 +1047,18 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
         if (pageOffset + ti.pageSize > rawFrame.size()) break;
 
         auto fileOffset = static_cast<off_t>(absPageNum * ti.pageSize);
-        ::pwrite(ti.localFd, rawFrame.data() + pageOffset, ti.pageSize, fileOffset);
+        // CTR encrypt before writing to local cache.
+        if (config_.encryptionKey) {
+            std::vector<uint8_t> encPage(ti.pageSize);
+            aes256_ctr(rawFrame.data() + pageOffset, encPage.data(),
+                ti.pageSize, absPageNum, *config_.encryptionKey);
+            ::pwrite(ti.localFd, encPage.data(), ti.pageSize, fileOffset);
+        } else {
+            ::pwrite(ti.localFd, rawFrame.data() + pageOffset, ti.pageSize, fileOffset);
+        }
         ti.bitmap->markPresent(absPageNum);
 
+        // Return plaintext (pre-encryption) to caller.
         if (requestedPageOut && localIdx == requestedLocalIdx) {
             *requestedPageOut = std::vector<uint8_t>(
                 rawFrame.data() + pageOffset,
@@ -779,6 +1131,15 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
             std::vector<uint8_t> frameData(
                 blob->begin() + entry.offset,
                 blob->begin() + entry.offset + entry.len);
+
+            // GCM decrypt the frame if encrypted.
+            if (config_.encryptionKey) {
+                auto decrypted = aes256_gcm_decrypt(frameData.data(),
+                    frameData.size(), *config_.encryptionKey);
+                if (decrypted.empty()) continue; // Auth failure, skip frame.
+                frameData = std::move(decrypted);
+            }
+
             auto rawFrame = decodeFrame(frameData, pagesInFrame, ti.pageSize);
 
             for (uint32_t i = 0; i < pagesInFrame; i++) {
@@ -788,9 +1149,18 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
                 if (pageOffset + ti.pageSize > rawFrame.size()) break;
 
                 auto fileOffset = static_cast<off_t>(absPageNum * ti.pageSize);
-                ::pwrite(ti.localFd, rawFrame.data() + pageOffset, ti.pageSize, fileOffset);
+                // CTR encrypt before writing to local cache.
+                if (config_.encryptionKey) {
+                    std::vector<uint8_t> encPage(ti.pageSize);
+                    aes256_ctr(rawFrame.data() + pageOffset, encPage.data(),
+                        ti.pageSize, absPageNum, *config_.encryptionKey);
+                    ::pwrite(ti.localFd, encPage.data(), ti.pageSize, fileOffset);
+                } else {
+                    ::pwrite(ti.localFd, rawFrame.data() + pageOffset, ti.pageSize, fileOffset);
+                }
                 ti.bitmap->markPresent(absPageNum);
 
+                // Return plaintext to caller.
                 if (requestedPageOut && localIdx == requestedLocalIdx) {
                     *requestedPageOut = std::vector<uint8_t>(
                         rawFrame.data() + pageOffset,
@@ -798,10 +1168,73 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
                 }
             }
         }
+
+        // Phase GraphDrift: apply subframe overrides on top of base group.
+        // Override frames replace the corresponding base frames.
+        std::unordered_map<size_t, SubframeOverride> overrides;
+        {
+            std::lock_guard lock(ti.manifestMu);
+            if (pageGroupId < ti.manifest.subframeOverrides.size()) {
+                overrides = ti.manifest.subframeOverrides[pageGroupId];
+            }
+        }
+        for (auto& [ovFrameIdx, ov] : overrides) {
+            if (ov.key.empty() || ov.entry.len == 0) continue;
+            auto ovBlob = ti.s3->getObject(ov.key);
+            if (!ovBlob.has_value()) continue;
+
+            auto ovFrameStartLocal = static_cast<uint32_t>(ovFrameIdx) * subPPF;
+            auto groupStartOv = pageGroupId * ti.pagesPerGroup;
+            uint32_t ovPagesInFrame = ov.entry.pageCount > 0 ? ov.entry.pageCount : subPPF;
+
+            std::vector<uint8_t> ovFrameData;
+            if (config_.encryptionKey) {
+                ovFrameData = aes256_gcm_decrypt(ovBlob->data(),
+                    ovBlob->size(), *config_.encryptionKey);
+                if (ovFrameData.empty()) continue;
+            } else {
+                ovFrameData = std::move(*ovBlob);
+            }
+
+            auto rawOvFrame = decodeFrame(ovFrameData, ovPagesInFrame, ti.pageSize);
+            for (uint32_t i = 0; i < ovPagesInFrame; i++) {
+                auto localIdx = ovFrameStartLocal + i;
+                auto absPageNum = groupStartOv + localIdx;
+                auto pageOffset = static_cast<size_t>(i) * ti.pageSize;
+                if (pageOffset + ti.pageSize > rawOvFrame.size()) break;
+
+                auto fileOffset = static_cast<off_t>(absPageNum * ti.pageSize);
+                if (config_.encryptionKey) {
+                    std::vector<uint8_t> encPage(ti.pageSize);
+                    aes256_ctr(rawOvFrame.data() + pageOffset, encPage.data(),
+                        ti.pageSize, absPageNum, *config_.encryptionKey);
+                    ::pwrite(ti.localFd, encPage.data(), ti.pageSize, fileOffset);
+                } else {
+                    ::pwrite(ti.localFd, rawOvFrame.data() + pageOffset,
+                        ti.pageSize, fileOffset);
+                }
+                ti.bitmap->markPresent(absPageNum);
+
+                if (requestedPageOut && localIdx == requestedLocalIdx) {
+                    *requestedPageOut = std::vector<uint8_t>(
+                        rawOvFrame.data() + pageOffset,
+                        rawOvFrame.data() + pageOffset + ti.pageSize);
+                }
+            }
+        }
+
         return true;
     }
 
     // Legacy path: per-page compressed with offset header.
+    // GCM decrypt the whole legacy blob if encrypted.
+    if (config_.encryptionKey) {
+        auto decrypted = aes256_gcm_decrypt(blob->data(), blob->size(),
+            *config_.encryptionKey);
+        if (decrypted.empty()) return false; // Auth failure.
+        *blob = std::move(decrypted);
+    }
+
     for (uint32_t i = 0; i < ti.pagesPerGroup; i++) {
         auto compressedPage = extractPage(*blob, i, ti.pagesPerGroup);
         if (!compressedPage.has_value() || compressedPage->empty()) continue;
@@ -812,9 +1245,18 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
 
         auto absPageNum = pageGroupId * ti.pagesPerGroup + i;
         auto fileOffset = static_cast<off_t>(absPageNum * ti.pageSize);
-        ::pwrite(ti.localFd, rawPage.data(), ti.pageSize, fileOffset);
+        // CTR encrypt before writing to local cache.
+        if (config_.encryptionKey) {
+            std::vector<uint8_t> encPage(ti.pageSize);
+            aes256_ctr(rawPage.data(), encPage.data(),
+                ti.pageSize, absPageNum, *config_.encryptionKey);
+            ::pwrite(ti.localFd, encPage.data(), ti.pageSize, fileOffset);
+        } else {
+            ::pwrite(ti.localFd, rawPage.data(), ti.pageSize, fileOffset);
+        }
         ti.bitmap->markPresent(absPageNum);
 
+        // Return plaintext to caller.
         if (requestedPageOut && i == requestedLocalIdx) {
             *requestedPageOut = std::move(rawPage);
         }
@@ -863,10 +1305,16 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
                 ti.tableMissCounters->reset(result.tableId);
             }
         }
+        // Touch group for eviction tracking.
+        ti.touchGroup(pageNum / ti.pagesPerGroup);
         std::vector<uint8_t> page(ti.pageSize);
         auto offset = static_cast<off_t>(pageNum * ti.pageSize);
         auto bytesRead = ::pread(ti.localFd, page.data(), ti.pageSize, offset);
         if (bytesRead == static_cast<ssize_t>(ti.pageSize)) {
+            if (config_.encryptionKey) {
+                aes256_ctr(page.data(), page.data(), ti.pageSize,
+                    pageNum, *config_.encryptionKey);
+            }
             return page;
         }
         // Fall through to S3 on read failure.
@@ -1039,6 +1487,14 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
         submitPrefetch(ti, prefetchGroups);
     }
 
+    // Touch group for eviction tracking.
+    ti.touchGroup(pageGroupId);
+
+    // Trigger eviction if cache is over budget.
+    if (config_.maxCacheBytes > 0) {
+        evictToBudget();
+    }
+
     // 8. Return the requested page.
     if (!requestedPage.empty()) {
         return requestedPage;
@@ -1058,6 +1514,16 @@ std::vector<uint8_t> TieredFileSystem::readOnePage(TieredFileInfo& ti, uint64_t 
 
 void TieredFileSystem::writeOnePage(TieredFileInfo& ti, uint64_t pageNum,
     const uint8_t* data) const {
+    // Track page classification during tracking mode (same as readOnePage).
+    {
+        std::lock_guard lock(ti.trackMu);
+        if (ti.trackMode == TieredFileInfo::TrackMode::STRUCTURAL && ti.structuralPages) {
+            ti.structuralPages->markPresent(pageNum);
+        } else if (ti.trackMode == TieredFileInfo::TrackMode::INDEX && ti.indexPages) {
+            ti.indexPages->markPresent(pageNum);
+        }
+    }
+
     {
         std::lock_guard lock(ti.dirtyMu);
         ti.dirtyPages[pageNum] = std::vector<uint8_t>(data, data + ti.pageSize);
@@ -1150,13 +1616,32 @@ void TieredFileSystem::doSyncFile(TieredFileInfo& ti) const {
 
     for (auto& [pageNum, rawPage] : dirtySnapshot) {
         auto fileOffset = static_cast<off_t>(pageNum * ti.pageSize);
-        ::pwrite(ti.localFd, rawPage.data(), ti.pageSize, fileOffset);
+        if (config_.encryptionKey) {
+            std::vector<uint8_t> encrypted(ti.pageSize);
+            aes256_ctr(rawPage.data(), encrypted.data(), ti.pageSize,
+                pageNum, *config_.encryptionKey);
+            ::pwrite(ti.localFd, encrypted.data(), ti.pageSize, fileOffset);
+        } else {
+            ::pwrite(ti.localFd, rawPage.data(), ti.pageSize, fileOffset);
+        }
         ti.bitmap->markPresent(pageNum);
     }
 
+    // Grow group arrays if writes extended beyond the initial group count.
+    {
+        uint64_t neededGroups = (maxPageNum + ti.pagesPerGroup) / ti.pagesPerGroup;
+        if (neededGroups > ti.totalGroups) {
+            ti.growGroupArrays(neededGroups, config_.maxCacheBytes > 0);
+        }
+    }
+
+    // Mark synced groups as PRESENT in group state tracking.
     std::unordered_set<uint64_t> affectedPageGroups;
     for (auto& [pageNum, _] : dirtySnapshot) {
         affectedPageGroups.insert(pageNum / ti.pagesPerGroup);
+    }
+    for (auto pgId : affectedPageGroups) {
+        ti.markGroupPresent(pgId);
     }
 
     {
@@ -1164,22 +1649,28 @@ void TieredFileSystem::doSyncFile(TieredFileInfo& ti) const {
         for (auto pgId : affectedPageGroups) {
             ti.pendingPageGroups.insert(pgId);
         }
+        // Phase GraphDrift: track which pages within each group are dirty.
+        for (auto& [pageNum, _] : dirtySnapshot) {
+            auto pgId = pageNum / ti.pagesPerGroup;
+            auto localIdx = static_cast<uint32_t>(pageNum % ti.pagesPerGroup);
+            ti.pendingDirtyPages[pgId].insert(localIdx);
+        }
     }
 
     ti.bitmap->persist();
 
+    // Phase GraphZenith: stamp journal_seq from config into manifest
+    // so followers know where to replay graphstream journal from.
     {
-        Manifest m;
-        {
-            std::lock_guard lock(ti.manifestMu);
-            m = ti.manifest;
-        }
-        auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
-        auto json = m.toJSON();
-        std::ofstream mf(manifestPath, std::ios::binary | std::ios::trunc);
-        mf.write(json.data(), json.size());
+        std::lock_guard lock(ti.manifestMu);
+        ti.manifest.journalSeq = config_.journalSeq;
     }
 
+    // Phase Laika: S3Primary ordering fix. Upload to S3 first, then persist
+    // locally. flushPendingPageGroups() handles both the S3 upload and local
+    // manifest persist in the correct order (S3 first, local second).
+    // No separate local persist here; that was a bug that could leave the
+    // local manifest ahead of S3 after a crash.
     flushPendingPageGroups();
 }
 
@@ -1192,6 +1683,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
     auto& ti = *afi;
 
     std::unordered_set<uint64_t> pending;
+    std::unordered_map<uint64_t, std::unordered_set<uint32_t>> dirtyPagesPerGroup;
     {
         std::lock_guard lock(ti.pendingMu);
         if (ti.pendingPageGroups.empty()) {
@@ -1199,6 +1691,8 @@ void TieredFileSystem::flushPendingPageGroups() const {
         }
         pending = std::move(ti.pendingPageGroups);
         ti.pendingPageGroups.clear();
+        dirtyPagesPerGroup = std::move(ti.pendingDirtyPages);
+        ti.pendingDirtyPages.clear();
     }
 
     uint64_t nextVersion;
@@ -1213,7 +1707,118 @@ void TieredFileSystem::flushPendingPageGroups() const {
     bool useSeekable = config_.subPagesPerFrame > 0;
     std::unordered_map<uint64_t, std::vector<FrameEntry>> newFrameTables;
 
+    // Phase GraphDrift: override tracking.
+    // Carry forward existing overrides, then add/replace as needed.
+    std::vector<std::unordered_map<size_t, SubframeOverride>> newSubframeOverrides;
+    std::vector<std::string> staleOverrideKeys; // Old override keys to GC.
+    std::unordered_set<uint64_t> fullRewriteGroups;
+    {
+        std::lock_guard lock(ti.manifestMu);
+        newSubframeOverrides = ti.manifest.subframeOverrides;
+    }
+
+    // Compute effective override threshold.
+    uint32_t effectiveThreshold = config_.overrideThreshold;
+    if (effectiveThreshold == 0 && useSeekable && config_.subPagesPerFrame > 0) {
+        auto framesPerGroup = (ti.pagesPerGroup + config_.subPagesPerFrame - 1) /
+            config_.subPagesPerFrame;
+        effectiveThreshold = std::max(1u, framesPerGroup / 4);
+    }
+
     for (auto pgId : pending) {
+        // Phase GraphDrift: determine dirty frames for override decision.
+        bool hasExistingFrameTable = false;
+        {
+            std::lock_guard lock(ti.manifestMu);
+            hasExistingFrameTable = useSeekable &&
+                pgId < ti.manifest.frameTables.size() &&
+                !ti.manifest.frameTables[pgId].empty();
+        }
+
+        // Compute dirty frame indices from dirty pages.
+        std::unordered_set<uint32_t> dirtyFrameSet;
+        bool canUseOverride = hasExistingFrameTable && effectiveThreshold > 0;
+        if (canUseOverride) {
+            auto it = dirtyPagesPerGroup.find(pgId);
+            if (it != dirtyPagesPerGroup.end()) {
+                for (auto localIdx : it->second) {
+                    dirtyFrameSet.insert(localIdx / config_.subPagesPerFrame);
+                }
+            }
+            // If no dirty pages tracked (shouldn't happen), fall back to full rewrite.
+            if (dirtyFrameSet.empty()) canUseOverride = false;
+        }
+
+        bool useOverride = canUseOverride &&
+            dirtyFrameSet.size() < effectiveThreshold;
+
+        if (useOverride) {
+            // Phase GraphDrift: override path -- encode only dirty frames.
+            while (newSubframeOverrides.size() <= pgId) {
+                newSubframeOverrides.emplace_back();
+            }
+
+            for (auto frameIdx : dirtyFrameSet) {
+                auto frameStartLocal = frameIdx * config_.subPagesPerFrame;
+                auto frameEndLocal = std::min(
+                    frameStartLocal + config_.subPagesPerFrame, ti.pagesPerGroup);
+                auto pagesInFrame = frameEndLocal - frameStartLocal;
+
+                // Gather raw pages for this frame from local cache.
+                std::vector<std::optional<std::vector<uint8_t>>> framePages(pagesInFrame);
+                for (uint32_t i = 0; i < pagesInFrame; i++) {
+                    auto absPageNum = pgId * ti.pagesPerGroup + frameStartLocal + i;
+                    if (!ti.bitmap->isPresent(absPageNum)) continue;
+                    std::vector<uint8_t> rawPage(ti.pageSize);
+                    auto fileOffset = static_cast<off_t>(absPageNum * ti.pageSize);
+                    auto bytesRead = ::pread(ti.localFd, rawPage.data(),
+                        ti.pageSize, fileOffset);
+                    if (bytesRead != static_cast<ssize_t>(ti.pageSize)) continue;
+                    if (config_.encryptionKey) {
+                        aes256_ctr(rawPage.data(), rawPage.data(), ti.pageSize,
+                            absPageNum, *config_.encryptionKey);
+                    }
+                    framePages[i] = std::move(rawPage);
+                }
+
+                // Encode just this frame using encodeSeekable with 1 frame.
+                auto result = encodeSeekable(framePages, ti.pageSize,
+                    pagesInFrame, ti.compressionLevel);
+                if (result.blob.empty()) continue;
+
+                std::vector<uint8_t> encoded;
+                if (config_.encryptionKey) {
+                    encoded = aes256_gcm_encrypt(result.blob.data(),
+                        result.blob.size(), *config_.encryptionKey);
+                } else {
+                    encoded = std::move(result.blob);
+                }
+
+                auto overrideKey = ti.s3->overrideFrameKey(pgId, frameIdx, nextVersion);
+
+                // Collect old override key for GC.
+                auto ovIt = newSubframeOverrides[pgId].find(frameIdx);
+                if (ovIt != newSubframeOverrides[pgId].end()) {
+                    staleOverrideKeys.push_back(ovIt->second.key);
+                }
+
+                if (ti.s3->putObject(overrideKey, encoded.data(), encoded.size())) {
+                    SubframeOverride ov;
+                    ov.key = overrideKey;
+                    ov.entry.offset = 0;
+                    ov.entry.len = static_cast<uint32_t>(encoded.size());
+                    ov.entry.pageCount = pagesInFrame;
+                    newSubframeOverrides[pgId][frameIdx] = std::move(ov);
+                    anyUploaded = true;
+                }
+            }
+            // Base group key stays the same: no re-upload.
+            continue;
+        }
+
+        // Full rewrite path (existing behavior).
+        fullRewriteGroups.insert(pgId);
+
         // Read raw pages from local cache file.
         std::vector<std::optional<std::vector<uint8_t>>> rawPages(ti.pagesPerGroup);
         bool anyPresent = false;
@@ -1238,6 +1843,11 @@ void TieredFileSystem::flushPendingPageGroups() const {
                     "pread incomplete at page " + std::to_string(absPageNum) +
                     ": expected " + std::to_string(ti.pageSize) +
                     " bytes, got " + std::to_string(bytesRead));
+            }
+            // Local cache pages are CTR encrypted. Decrypt for encoding.
+            if (config_.encryptionKey) {
+                aes256_ctr(rawPage.data(), rawPage.data(), ti.pageSize,
+                    absPageNum, *config_.encryptionKey);
             }
             rawPages[i] = std::move(rawPage);
             anyPresent = true;
@@ -1283,6 +1893,13 @@ void TieredFileSystem::flushPendingPageGroups() const {
                             std::vector<uint8_t> frameData(
                                 oldBlob->begin() + entry.offset,
                                 oldBlob->begin() + entry.offset + entry.len);
+                            // GCM decrypt old frame if encrypted.
+                            if (config_.encryptionKey) {
+                                auto decrypted = aes256_gcm_decrypt(frameData.data(),
+                                    frameData.size(), *config_.encryptionKey);
+                                if (decrypted.empty()) continue;
+                                frameData = std::move(decrypted);
+                            }
                             auto rawFrame = decodeFrame(frameData, pagesInFrame, ti.pageSize);
                             for (uint32_t i = 0; i < pagesInFrame; i++) {
                                 auto localIdx = frameStartLocal + i;
@@ -1296,7 +1913,12 @@ void TieredFileSystem::flushPendingPageGroups() const {
                             }
                         }
                     } else {
-                        // Decode old legacy blob.
+                        // Decode old legacy blob. GCM decrypt if encrypted.
+                        if (config_.encryptionKey) {
+                            auto dec = aes256_gcm_decrypt(oldBlob->data(),
+                                oldBlob->size(), *config_.encryptionKey);
+                            if (!dec.empty()) *oldBlob = std::move(dec);
+                        }
                         for (uint32_t i = 0; i < ti.pagesPerGroup; i++) {
                             if (rawPages[i].has_value()) continue;
                             auto compressedPage = extractPage(*oldBlob, i, ti.pagesPerGroup);
@@ -1316,8 +1938,32 @@ void TieredFileSystem::flushPendingPageGroups() const {
         if (useSeekable) {
             auto result = encodeSeekable(rawPages, ti.pageSize,
                 config_.subPagesPerFrame, ti.compressionLevel);
-            encoded = std::move(result.blob);
-            newFrameTables[pgId] = std::move(result.frameTable);
+
+            // GCM encrypt each frame individually.
+            if (config_.encryptionKey) {
+                std::vector<uint8_t> encBlob;
+                std::vector<FrameEntry> encFrameTable;
+                for (auto& fe : result.frameTable) {
+                    if (fe.len == 0) {
+                        encFrameTable.push_back(fe);
+                        continue;
+                    }
+                    auto encFrame = aes256_gcm_encrypt(
+                        result.blob.data() + fe.offset, fe.len,
+                        *config_.encryptionKey);
+                    FrameEntry encEntry;
+                    encEntry.offset = encBlob.size();
+                    encEntry.len = static_cast<uint32_t>(encFrame.size());
+                    encEntry.pageCount = fe.pageCount;
+                    encFrameTable.push_back(encEntry);
+                    encBlob.insert(encBlob.end(), encFrame.begin(), encFrame.end());
+                }
+                encoded = std::move(encBlob);
+                newFrameTables[pgId] = std::move(encFrameTable);
+            } else {
+                encoded = std::move(result.blob);
+                newFrameTables[pgId] = std::move(result.frameTable);
+            }
         } else {
             // Legacy: compress each page individually.
             std::vector<std::optional<std::vector<uint8_t>>> compressedPages(ti.pagesPerGroup);
@@ -1328,6 +1974,11 @@ void TieredFileSystem::flushPendingPageGroups() const {
                 }
             }
             encoded = encodeChunk(compressedPages, ti.pagesPerGroup);
+            // GCM encrypt the whole legacy blob.
+            if (config_.encryptionKey) {
+                encoded = aes256_gcm_encrypt(encoded.data(), encoded.size(),
+                    *config_.encryptionKey);
+            }
         }
 
         if (ti.s3->putObject(pgKey, encoded.data(), encoded.size())) {
@@ -1351,6 +2002,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
     if (useSeekable) {
         newManifest.subPagesPerFrame = config_.subPagesPerFrame;
     }
+    newManifest.encrypted = config_.encryptionKey.has_value();
 
     auto maxGroupId = uint64_t{0};
     for (auto& [pgId, _] : newKeys) {
@@ -1369,6 +2021,163 @@ void TieredFileSystem::flushPendingPageGroups() const {
         }
     }
 
+    // Phase GraphDrift: clear overrides for groups that got full rewrites.
+    for (auto pgId : fullRewriteGroups) {
+        if (pgId < newSubframeOverrides.size()) {
+            for (auto& [_, ov] : newSubframeOverrides[pgId]) {
+                staleOverrideKeys.push_back(ov.key);
+            }
+            newSubframeOverrides[pgId].clear();
+        }
+    }
+
+    newManifest.subframeOverrides = std::move(newSubframeOverrides);
+    newManifest.normalizeOverrides();
+
+    // Phase GraphDrift: auto-compaction.
+    // Groups that accumulated too many overrides get merged back into the base.
+    if (config_.compactionThreshold > 0 && useSeekable) {
+        std::vector<uint64_t> groupsToCompact;
+        for (size_t gid = 0; gid < newManifest.subframeOverrides.size(); gid++) {
+            if (newManifest.subframeOverrides[gid].size() >= config_.compactionThreshold) {
+                groupsToCompact.push_back(gid);
+            }
+        }
+
+        for (auto gid : groupsToCompact) {
+            // Compact: read base group + all override frames, merge, upload new base.
+            auto compactVersion = nextVersion; // Reuse same version for compaction.
+
+            std::string baseKey;
+            std::vector<FrameEntry> baseFrameTable;
+            uint32_t baseSubPPF = 0;
+            {
+                if (gid < newManifest.pageGroupKeys.size()) {
+                    baseKey = newManifest.pageGroupKeys[gid];
+                }
+                if (gid < newManifest.frameTables.size()) {
+                    baseFrameTable = newManifest.frameTables[gid];
+                }
+                baseSubPPF = newManifest.subPagesPerFrame;
+            }
+            if (baseKey.empty() || baseSubPPF == 0) continue;
+
+            // Read base group.
+            auto baseBlob = ti.s3->getObject(baseKey);
+            if (!baseBlob.has_value()) continue;
+
+            // Decode all frames from base group.
+            std::vector<std::optional<std::vector<uint8_t>>> mergedPages(ti.pagesPerGroup);
+            for (uint32_t f = 0; f < baseFrameTable.size(); f++) {
+                auto& entry = baseFrameTable[f];
+                if (entry.len == 0) continue;
+                if (entry.offset + entry.len > baseBlob->size()) break;
+                auto frameStartLocal = f * baseSubPPF;
+                uint32_t pagesInFrame = entry.pageCount > 0
+                    ? entry.pageCount
+                    : std::min(baseSubPPF, ti.pagesPerGroup - frameStartLocal);
+                std::vector<uint8_t> frameData(
+                    baseBlob->begin() + entry.offset,
+                    baseBlob->begin() + entry.offset + entry.len);
+                if (config_.encryptionKey) {
+                    auto dec = aes256_gcm_decrypt(frameData.data(),
+                        frameData.size(), *config_.encryptionKey);
+                    if (dec.empty()) continue;
+                    frameData = std::move(dec);
+                }
+                auto rawFrame = decodeFrame(frameData, pagesInFrame, ti.pageSize);
+                for (uint32_t i = 0; i < pagesInFrame; i++) {
+                    auto localIdx = frameStartLocal + i;
+                    auto off = static_cast<size_t>(i) * ti.pageSize;
+                    if (off + ti.pageSize <= rawFrame.size()) {
+                        mergedPages[localIdx] = std::vector<uint8_t>(
+                            rawFrame.data() + off,
+                            rawFrame.data() + off + ti.pageSize);
+                    }
+                }
+            }
+
+            // Apply overrides on top.
+            for (auto& [frameIdx, ov] : newManifest.subframeOverrides[gid]) {
+                if (ov.key.empty() || ov.entry.len == 0) continue;
+                auto ovBlob = ti.s3->getObject(ov.key);
+                if (!ovBlob.has_value()) continue;
+                auto frameStartLocal = static_cast<uint32_t>(frameIdx) * baseSubPPF;
+                uint32_t pagesInFrame = ov.entry.pageCount > 0
+                    ? ov.entry.pageCount
+                    : std::min(baseSubPPF, ti.pagesPerGroup - frameStartLocal);
+                std::vector<uint8_t> ovData;
+                if (config_.encryptionKey) {
+                    ovData = aes256_gcm_decrypt(ovBlob->data(),
+                        ovBlob->size(), *config_.encryptionKey);
+                    if (ovData.empty()) continue;
+                } else {
+                    ovData = std::move(*ovBlob);
+                }
+                auto rawFrame = decodeFrame(ovData, pagesInFrame, ti.pageSize);
+                for (uint32_t i = 0; i < pagesInFrame; i++) {
+                    auto localIdx = frameStartLocal + i;
+                    auto off = static_cast<size_t>(i) * ti.pageSize;
+                    if (off + ti.pageSize <= rawFrame.size()) {
+                        mergedPages[localIdx] = std::vector<uint8_t>(
+                            rawFrame.data() + off,
+                            rawFrame.data() + off + ti.pageSize);
+                    }
+                }
+                staleOverrideKeys.push_back(ov.key);
+            }
+
+            // Re-encode full group.
+            auto result = encodeSeekable(mergedPages, ti.pageSize,
+                config_.subPagesPerFrame, ti.compressionLevel);
+            if (result.blob.empty()) continue;
+
+            std::vector<uint8_t> encoded;
+            std::vector<FrameEntry> compactFrameTable;
+            if (config_.encryptionKey) {
+                std::vector<uint8_t> encBlob;
+                for (auto& fe : result.frameTable) {
+                    if (fe.len == 0) {
+                        compactFrameTable.push_back(fe);
+                        continue;
+                    }
+                    auto encFrame = aes256_gcm_encrypt(
+                        result.blob.data() + fe.offset, fe.len,
+                        *config_.encryptionKey);
+                    FrameEntry encEntry;
+                    encEntry.offset = encBlob.size();
+                    encEntry.len = static_cast<uint32_t>(encFrame.size());
+                    encEntry.pageCount = fe.pageCount;
+                    compactFrameTable.push_back(encEntry);
+                    encBlob.insert(encBlob.end(), encFrame.begin(), encFrame.end());
+                }
+                encoded = std::move(encBlob);
+            } else {
+                encoded = std::move(result.blob);
+                compactFrameTable = std::move(result.frameTable);
+            }
+
+            auto compactKey = ti.s3->pageGroupKey(gid, compactVersion);
+            if (ti.s3->putObject(compactKey, encoded.data(), encoded.size())) {
+                // Mark old base key for GC (if different from compacted key).
+                if (baseKey != compactKey) {
+                    staleOverrideKeys.push_back(baseKey);
+                }
+                newManifest.pageGroupKeys[gid] = compactKey;
+                newManifest.frameTables[gid] = compactFrameTable;
+                newManifest.subframeOverrides[gid].clear();
+            }
+        }
+    }
+
+    // Phase Laika: S3Primary ordering fix. Publish manifest to S3 FIRST,
+    // then persist locally. If we crash after S3 publish but before local
+    // persist, the local manifest is behind S3, which is safe (we re-fetch
+    // from S3 on reopen). The old order (local first, then S3) was a data
+    // loss bug: crash after local persist but before S3 upload left the
+    // local manifest claiming a version that S3 never received.
+    ti.s3->putManifest(newManifest);
+
     {
         auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
         auto json = newManifest.toJSON();
@@ -1376,11 +2185,14 @@ void TieredFileSystem::flushPendingPageGroups() const {
         mf.write(json.data(), json.size());
     }
 
-    ti.s3->putManifest(newManifest);
-
     {
         std::unique_lock lock(ti.manifestMu);
         ti.manifest = newManifest;
+    }
+
+    // Phase GraphDrift: async GC of stale override keys.
+    for (auto& key : staleOverrideKeys) {
+        ti.s3->deleteObject(key);
     }
 }
 
@@ -1395,6 +2207,174 @@ uint64_t TieredFileSystem::evictStalePageGroups() {
     }
 
     return s3_->evictStalePageGroups(currentManifest);
+}
+
+// ============================================================================
+// Phase GraphZenith: hakuzu integration methods
+// ============================================================================
+
+uint64_t TieredFileSystem::syncAndGetVersion() {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return 0;
+
+    doSyncFile(*afi);
+
+    std::lock_guard lock(afi->manifestMu);
+    return afi->manifest.version;
+}
+
+uint64_t TieredFileSystem::getManifestVersion() const {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) return 0;
+
+    std::lock_guard lock(afi->manifestMu);
+    return afi->manifest.version;
+}
+
+uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
+    auto parsed = Manifest::fromJSON(jsonStr);
+    if (!parsed.has_value()) {
+        throw std::runtime_error("applyRemoteManifest: invalid manifest JSON");
+    }
+
+    auto* afi = activeFileInfo_.load();
+    if (!afi) {
+        throw std::runtime_error("applyRemoteManifest: no active file");
+    }
+
+    auto& ti = *afi;
+    auto& newManifest = *parsed;
+
+    // Validate pageSize consistency.
+    if (newManifest.pageSize != 0 && newManifest.pageSize != config_.pageSize) {
+        throw std::runtime_error("Remote manifest pageSize mismatch: got " +
+            std::to_string(newManifest.pageSize) + ", expected " +
+            std::to_string(config_.pageSize));
+    }
+
+    // Hold manifestMu across the entire operation to prevent concurrent readers
+    // from seeing stale state between cache invalidation and manifest update.
+    std::lock_guard lock(ti.manifestMu);
+    Manifest oldManifest = ti.manifest;
+
+    // If S3 version is older or equal, nothing to do (except crash recovery case).
+    if (newManifest.version < oldManifest.version) {
+        // Local is "newer" (crash during write, manifest never published).
+        // Discard local, use S3, invalidate entire cache.
+        ti.bitmap->clear();
+        ti.resetGroupStates();
+        ti.manifest = newManifest;
+
+        // Persist atomically: write tmp then rename.
+        auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
+        auto tmpPath = manifestPath.string() + ".tmp";
+        auto json = newManifest.toJSON();
+        {
+            std::ofstream mf(tmpPath, std::ios::binary | std::ios::trunc);
+            mf.write(json.data(), json.size());
+            mf.flush();
+        }
+        std::filesystem::rename(tmpPath, manifestPath);
+
+        return newManifest.version;
+    }
+
+    if (newManifest.version == oldManifest.version) {
+        // Same version, cache is warm.
+        return newManifest.version;
+    }
+
+    // S3 is newer: diff manifests, invalidate changed groups.
+    auto maxGroups = std::max(oldManifest.pageGroupKeys.size(),
+                              newManifest.pageGroupKeys.size());
+    for (size_t gid = 0; gid < maxGroups; gid++) {
+        bool changed = false;
+
+        // Key changed or new group appeared.
+        auto oldKey = gid < oldManifest.pageGroupKeys.size()
+            ? oldManifest.pageGroupKeys[gid] : std::string{};
+        auto newKey = gid < newManifest.pageGroupKeys.size()
+            ? newManifest.pageGroupKeys[gid] : std::string{};
+        if (oldKey != newKey) changed = true;
+
+        // Subframe overrides changed.
+        if (!changed) {
+            bool oldHas = gid < oldManifest.subframeOverrides.size() &&
+                !oldManifest.subframeOverrides[gid].empty();
+            bool newHas = gid < newManifest.subframeOverrides.size() &&
+                !newManifest.subframeOverrides[gid].empty();
+
+            if (oldHas != newHas) {
+                changed = true;
+            } else if (oldHas && newHas) {
+                auto& ov1 = oldManifest.subframeOverrides[gid];
+                auto& ov2 = newManifest.subframeOverrides[gid];
+                if (ov1.size() != ov2.size()) {
+                    changed = true;
+                } else {
+                    for (auto& [idx, ov] : ov1) {
+                        auto it = ov2.find(idx);
+                        if (it == ov2.end() || it->second.key != ov.key ||
+                            it->second.entry.offset != ov.entry.offset ||
+                            it->second.entry.len != ov.entry.len) {
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (changed) {
+            // Invalidate this group's cached pages.
+            auto startPage = static_cast<uint64_t>(gid) * ti.pagesPerGroup;
+            auto endPage = startPage + ti.pagesPerGroup;
+            if (endPage > newManifest.pageCount) endPage = newManifest.pageCount;
+            if (endPage > startPage) {
+                ti.bitmap->clearRange(startPage, endPage - startPage);
+            }
+            if (gid < ti.totalGroups) {
+                ti.markGroupNone(gid);
+            }
+        }
+    }
+
+    // Grow group arrays if needed.
+    if (newManifest.pageCount > 0) {
+        auto neededGroups = (newManifest.pageCount + ti.pagesPerGroup - 1) / ti.pagesPerGroup;
+        if (neededGroups > ti.totalGroups) {
+            ti.growGroupArrays(neededGroups, config_.maxCacheBytes > 0);
+        }
+    }
+
+    // Resize local cache file if needed.
+    if (newManifest.pageCount > oldManifest.pageCount) {
+        auto targetSize = static_cast<off_t>(newManifest.pageCount * newManifest.pageSize);
+        ::ftruncate(ti.localFd, targetSize);
+    }
+
+    // Resize bitmap if needed.
+    if (newManifest.pageCount > 0) {
+        ti.bitmap->resize(newManifest.pageCount);
+    }
+
+    ti.manifest = newManifest;
+
+    ti.bitmap->persist();
+
+    // After updating in-memory state, persist manifest atomically.
+    // Write to tmp file then rename to avoid corrupt manifest on crash.
+    auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
+    auto tmpPath = manifestPath.string() + ".tmp";
+    auto json = newManifest.toJSON();
+    {
+        std::ofstream mf(tmpPath, std::ios::binary | std::ios::trunc);
+        mf.write(json.data(), json.size());
+        mf.flush();
+    }
+    std::filesystem::rename(tmpPath, manifestPath);
+
+    return newManifest.version;
 }
 
 } // namespace tiered

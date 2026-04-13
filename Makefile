@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-s3 bench clean
+.PHONY: build test test-unit test-s3 test-extension bench clean
 
 BUILD_DIR ?= build
 CMAKE_FLAGS ?= -DCMAKE_BUILD_TYPE=Debug
@@ -17,13 +17,21 @@ build:
 	cmake --build $(BUILD_DIR) -- -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 test: build
-	cd $(BUILD_DIR) && ctest --output-on-failure -R "ChunkCodec|Manifest|PageBitmap|PageIO|Prefetch[^S]|VFS[^S]"
+	cd $(BUILD_DIR) && ctest --output-on-failure -R "ChunkCodec|Manifest|PageBitmap|PageIO|Prefetch[^S]|VFS[^S]|Crypto|Eviction|Drift|Zenith"
 
 test-unit: test
 
 # S3 integration tests (requires TIGRIS_STORAGE_* env vars).
 test-s3: build
 	cd $(BUILD_DIR) && ctest --output-on-failure -R "S3|PrefetchS3|VFSS3|RangeRequest"
+
+# Extension tests (requires LADYBUG_DIR).
+LADYBUG_DIR ?= $(shell cd .. && pwd)/ladybug
+test-extension:
+	cmake -B $(BUILD_DIR) $(CMAKE_FLAGS) -DBUILD_EXTENSION_TESTS=ON \
+		-DLADYBUG_DIR=$(LADYBUG_DIR) .
+	cmake --build $(BUILD_DIR) --target test_turbograph_extension -- -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+	cd $(BUILD_DIR) && ctest --output-on-failure -R "TurbographExtension"
 
 # Full benchmark (requires LadybugDB).
 bench:
@@ -43,5 +51,6 @@ help:
 	@echo "make test         - Run unit tests (no S3 needed)"
 	@echo "make test-s3      - Run S3 integration tests"
 	@echo "make bench        - Build benchmark (needs LADYBUG_DIR)"
+	@echo "make test-extension - Run extension tests (needs LADYBUG_DIR)"
 	@echo "make deploy-bench - Deploy benchmark to Fly"
 	@echo "make clean        - Remove build dir"
