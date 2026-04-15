@@ -1,17 +1,33 @@
 # Turbograph LadybugDB Extension
 #
 # Built in two modes:
-#   1. As part of LadybugDB tree: add_subdirectory() from ladybug's extension/CMakeLists.txt
-#      Uses build_extension_lib() macro, produces .lbug_extension shared library.
+#   1. As part of LadybugDB tree: include() from ladybug's extension wrapper,
+#      or add_subdirectory() from ladybug's extension/CMakeLists.txt.
+#      Uses build_extension_lib() macro, produces .lbug_extension (shared or static).
 #   2. As part of cypher_bench: source files compiled directly into bench target.
 #      No extension framework needed, just headers + liblbug static archives.
 #
 # Both modes require LADYBUG_DIR or being inside the ladybug build tree.
+#
+# Variables that callers can set BEFORE including this file:
+#   TURBOGRAPH_ROOT  - turbograph repo root (default: parent of this file's dir)
+#   LBUG_SRC_DIR     - ladybug source root (default: LADYBUG_DIR or PROJECT_SOURCE_DIR)
 
-# When called from ladybug's extension system, these variables are already set:
-#   PROJECT_SOURCE_DIR = ladybug root
-#   BUILD_STATIC_EXTENSION = ON/OFF
-# When called standalone, LADYBUG_DIR must be set.
+# Use CMAKE_CURRENT_LIST_DIR for paths relative to THIS file (works with both
+# add_subdirectory and include).
+if(NOT DEFINED TURBOGRAPH_ROOT)
+    get_filename_component(TURBOGRAPH_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+endif()
+
+# Determine ladybug source dir.
+if(NOT DEFINED LBUG_SRC_DIR)
+    if(DEFINED LADYBUG_DIR)
+        set(LBUG_SRC_DIR ${LADYBUG_DIR})
+    else()
+        # Assume we're inside the ladybug tree (called via add_subdirectory).
+        set(LBUG_SRC_DIR ${PROJECT_SOURCE_DIR})
+    endif()
+endif()
 
 SET(CMAKE_FIND_PACKAGE_SORT_ORDER NATURAL)
 SET(CMAKE_FIND_PACKAGE_SORT_DIRECTION DEC)
@@ -40,17 +56,6 @@ FetchContent_Declare(httplib
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(httplib)
 
-# Determine ladybug source dir.
-if(DEFINED LADYBUG_DIR)
-    set(LBUG_SRC_DIR ${LADYBUG_DIR})
-else()
-    # Assume we're inside the ladybug tree (called via add_subdirectory).
-    set(LBUG_SRC_DIR ${PROJECT_SOURCE_DIR})
-endif()
-
-# Determine turbograph root (this file is at turbograph/extension/CMakeLists.txt).
-get_filename_component(TURBOGRAPH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
-
 include_directories(
         ${LBUG_SRC_DIR}/src/include
         ${httplib_SOURCE_DIR}
@@ -60,7 +65,9 @@ include_directories(
         # turbograph VFS headers.
         ${TURBOGRAPH_ROOT}/include
         # Extension-specific headers.
-        include)
+        ${TURBOGRAPH_ROOT}/extension/include
+        # For static linking: generated_extension_loader.h includes "turbograph_extension.h"
+        ${TURBOGRAPH_ROOT}/extension/include/main)
 
 # ALP third-party headers (needed by compression.h).
 include_directories(${LBUG_SRC_DIR}/third_party/alp/include)
@@ -70,7 +77,7 @@ add_compile_definitions(LBUG_ZSTD_NAMESPACE)
 
 add_library(turbograph_extension_source
         OBJECT
-        # turbograph VFS core (from parent project).
+        # turbograph VFS core.
         ${TURBOGRAPH_ROOT}/src/s3_client.cpp
         ${TURBOGRAPH_ROOT}/src/connection_pool.cpp
         ${TURBOGRAPH_ROOT}/src/chunk_codec.cpp
@@ -78,12 +85,13 @@ add_library(turbograph_extension_source
         ${TURBOGRAPH_ROOT}/src/page_bitmap.cpp
         ${TURBOGRAPH_ROOT}/src/table_page_map.cpp
         ${TURBOGRAPH_ROOT}/src/tiered_file_system.cpp
+        ${TURBOGRAPH_ROOT}/src/crypto.cpp
         # Extension glue (registration + UDFs + parsers).
-        src/main/turbograph_extension.cpp
-        src/functions/turbograph_config.cpp
-        src/functions/turbograph_zenith.cpp
-        src/functions/table_map_builder.cpp
-        src/functions/plan_prefetch.cpp)
+        ${TURBOGRAPH_ROOT}/extension/src/main/turbograph_extension.cpp
+        ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_config.cpp
+        ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_zenith.cpp
+        ${TURBOGRAPH_ROOT}/extension/src/functions/table_map_builder.cpp
+        ${TURBOGRAPH_ROOT}/extension/src/functions/plan_prefetch.cpp)
 
 set(TURBOGRAPH_EXTENSION_OBJECT_FILES
         ${TURBOGRAPH_EXTENSION_OBJECT_FILES} $<TARGET_OBJECTS:turbograph_extension_source>)

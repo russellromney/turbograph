@@ -133,3 +133,29 @@ void TurbographExtension::load(main::ClientContext* context) {
 
 } // namespace turbograph_extension
 } // namespace lbug
+
+// ---------------------------------------------------------------------------
+// Dynamic extension entry points.
+//
+// lbug's ExtensionLibLoader uses dlsym() to find these C symbols after
+// dlopen(). Without extern "C", the symbols are C++-mangled and invisible.
+// Every lbug extension (httpfs, fts, etc.) exports these.
+// ---------------------------------------------------------------------------
+
+extern "C" {
+
+#if defined(_WIN32)
+#define TURBOGRAPH_EXPORT __declspec(dllexport)
+#else
+#define TURBOGRAPH_EXPORT __attribute__((visibility("default")))
+#endif
+
+TURBOGRAPH_EXPORT void init(lbug::main::ClientContext* context) {
+    lbug::turbograph_extension::TurbographExtension::load(context);
+}
+
+TURBOGRAPH_EXPORT const char* name() {
+    return lbug::turbograph_extension::TurbographExtension::EXTENSION_NAME;
+}
+
+} // extern "C"
