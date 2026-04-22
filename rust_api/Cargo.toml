@@ -1,0 +1,20 @@
+[package]
+name = "turbograph"
+version = "0.1.0"
+edition = "2021"
+authors = ["Russell Romney <russellromney@gmail.com>"]
+license = "Apache-2.0"
+description = "Rust handle for the turbograph tiered VFS — wraps Kuzu UDFs with an async Rust API."
+
+[dependencies]
+lbug = { version = "0.15", default-features = false }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tracing = "0.1"
+
+[features]
+# Off by default — tests need LBUG_STATIC_EXTENSIONS=turbograph + TURBOGRAPH_DIR.
+extension-tests = []
+
+[patch.crates-io]
+lbug = { path = "../../ladybug/tools/rust_api" }

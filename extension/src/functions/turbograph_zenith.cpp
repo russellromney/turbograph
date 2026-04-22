@@ -245,10 +245,10 @@ static void setManifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>
 
         try {
             auto result_pair = tfs->setManifestBytes(bytes);
-            // TODO(Phase GraphMeridian): UDF returns only result_pair.first (journal_seq).
+            // TODO(Phase GraphBackend follow-up): UDF returns only result_pair.first (journal_seq).
             // The second field (segment_prefix) is silently dropped. If Shared mode ever
             // needs the prefix after a hybrid apply, change return type to STRUCT or add
-            // a separate UDF. See hakuzu ROADMAP Phase GraphMeridian-c.
+            // a separate UDF.
             result.setNull(resultPos, false);
             result.setValue(resultPos, static_cast<int64_t>(result_pair.first));
         } catch (const std::exception& e) {

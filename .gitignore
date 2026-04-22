@@ -6,3 +6,5 @@ build/
 *.so
 .DS_Store
 Testing/
+rust_api/target/
+rust_api/Cargo.lock
