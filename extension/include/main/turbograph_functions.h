@@ -66,6 +66,28 @@ struct TurbographGetManifestFunction {
     static function::function_set getFunctionSet();
 };
 
+// Phase GraphTurbogenesis: turbograph_manifest_bytes() -> BLOB
+// Returns the current manifest as msgpack wire bytes (tag 0x01).
+struct TurbographManifestBytesFunction {
+    static constexpr const char* name = "turbograph_manifest_bytes";
+    static function::function_set getFunctionSet();
+};
+
+// Phase GraphTurbogenesis: turbograph_manifest_bytes_with_graphstream_delta(
+//   journal_seq INT64, segment_prefix STRING) -> BLOB
+// Returns hybrid manifest + graphstream delta as msgpack wire bytes (tag 0x02).
+struct TurbographManifestBytesWithGraphstreamDeltaFunction {
+    static constexpr const char* name = "turbograph_manifest_bytes_with_graphstream_delta";
+    static function::function_set getFunctionSet();
+};
+
+// Phase GraphTurbogenesis: turbograph_set_manifest_bytes(bytes BLOB) -> INT64
+// Follower applies a remote manifest from wire bytes. Returns the new version.
+struct TurbographSetManifestBytesFunction {
+    static constexpr const char* name = "turbograph_set_manifest_bytes";
+    static function::function_set getFunctionSet();
+};
+
 // Phase Cypher: extract table IDs from a Cypher query's logical plan.
 // Returns (nodeTableIds, relTableIds). Does not execute the query.
 std::pair<std::unordered_set<common::table_id_t>, std::unordered_set<common::table_id_t>>

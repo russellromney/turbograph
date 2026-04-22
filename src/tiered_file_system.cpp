@@ -2385,5 +2385,75 @@ uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
     return newManifest.version;
 }
 
+// ============================================================================
+// Phase GraphTurbogenesis: wire methods
+// ============================================================================
+
+static constexpr uint8_t TAG_PURE = 0x01;
+static constexpr uint8_t TAG_HYBRID = 0x02;
+
+std::vector<uint8_t> TieredFileSystem::manifestBytes() const {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) {
+        throw std::runtime_error("manifestBytes: no active file");
+    }
+    std::lock_guard lock(afi->manifestMu);
+    std::vector<uint8_t> body = afi->manifest.toMsgpack();
+    std::vector<uint8_t> out;
+    out.reserve(body.size() + 1);
+    out.push_back(TAG_PURE);
+    out.insert(out.end(), body.begin(), body.end());
+    return out;
+}
+
+std::vector<uint8_t> TieredFileSystem::manifestBytesWithGraphstreamDelta(
+    uint64_t journalSeq, const std::string& segmentPrefix) const {
+    auto* afi = activeFileInfo_.load();
+    if (!afi) {
+        throw std::runtime_error("manifestBytesWithGraphstreamDelta: no active file");
+    }
+    std::lock_guard lock(afi->manifestMu);
+    HybridPayload payload;
+    payload.turbograph = afi->manifest;
+    payload.graphstream_journal_seq = journalSeq;
+    payload.graphstream_segment_prefix = segmentPrefix;
+    std::vector<uint8_t> body = payload.toMsgpack();
+    std::vector<uint8_t> out;
+    out.reserve(body.size() + 1);
+    out.push_back(TAG_HYBRID);
+    out.insert(out.end(), body.begin(), body.end());
+    return out;
+}
+
+std::pair<uint64_t, std::string> TieredFileSystem::setManifestBytes(
+    const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) {
+        throw std::runtime_error("setManifestBytes: empty input");
+    }
+    uint8_t tag = bytes[0];
+    if (tag == TAG_PURE) {
+        auto manifest = Manifest::fromMsgpack(
+            std::vector<uint8_t>(bytes.begin() + 1, bytes.end()));
+        if (!manifest.has_value()) {
+            throw std::runtime_error("setManifestBytes: failed to decode pure manifest");
+        }
+        applyRemoteManifest(manifest->toJSON());
+        return {0, ""};
+    } else if (tag == TAG_HYBRID) {
+        auto payload = HybridPayload::fromMsgpack(
+            std::vector<uint8_t>(bytes.begin() + 1, bytes.end()));
+        if (!payload.has_value()) {
+            throw std::runtime_error("setManifestBytes: failed to decode hybrid manifest");
+        }
+        // TODO(Phase GraphMeridian): skip the JSON detour by growing
+        // applyRemoteManifest(Manifest&&). See hakuzu ROADMAP.
+        applyRemoteManifest(payload->turbograph.toJSON());
+        return {payload->graphstream_journal_seq, payload->graphstream_segment_prefix};
+    } else {
+        throw std::runtime_error(
+            "setManifestBytes: unknown wire tag: " + std::to_string(tag));
+    }
+}
+
 } // namespace tiered
 } // namespace lbug

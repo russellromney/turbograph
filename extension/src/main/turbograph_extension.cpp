@@ -129,6 +129,11 @@ void TurbographExtension::load(main::ClientContext* context) {
     extension::ExtensionUtils::addScalarFunc<TurbographGetManifestVersionFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographSetManifestFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographGetManifestFunction>(*db);
+
+    // Phase GraphTurbogenesis: opaque-payload wire UDFs.
+    extension::ExtensionUtils::addScalarFunc<TurbographManifestBytesFunction>(*db);
+    extension::ExtensionUtils::addScalarFunc<TurbographManifestBytesWithGraphstreamDeltaFunction>(*db);
+    extension::ExtensionUtils::addScalarFunc<TurbographSetManifestBytesFunction>(*db);
 }
 
 } // namespace turbograph_extension

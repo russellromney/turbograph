@@ -1,5 +1,26 @@
 # Changelog
 
+## Phase GraphTurbogenesis -- 2026-04-21
+
+Opaque manifest payload + msgpack wire. Closes the loop Phase
+Turbogenesis-b opened. turbograph owns its wire format end-to-end;
+no JSON converter layer in hakuzu.
+
+- `manifest.cpp`: manual msgpack encoder/decoder (~250 lines, no
+  external deps). `Manifest::toMsgpack()` / `fromMsgpack()`,
+  `HybridPayload::toMsgpack()` / `fromMsgpack()`.
+- `TieredFileSystem` wire methods: `manifestBytes()` (tag `0x01`),
+  `manifestBytesWithGraphstreamDelta(seq, prefix)` (tag `0x02`),
+  `setManifestBytes(bytes)` — decode, apply, return hybrid fields.
+- New Kuzu UDFs: `turbograph_manifest_bytes()`,
+  `turbograph_manifest_bytes_with_graphstream_delta()`,
+  `turbograph_set_manifest_bytes()`.
+- Data-fidelity regression tests in `test_vfs.cpp`: pure manifest,
+  hybrid payload, subframe overrides, and
+  `manifestBytesWithGraphstreamDelta` round-trips through
+  `setManifestBytes` + `manifestBytes`.
+- 18 core test suites pass.
+
 ## Phase Vault -- 2026-04-02
 
 Page-level encryption at rest. CTR mode for local NVMe cache (zero overhead,

@@ -225,6 +225,19 @@ public:
     // sets the new manifest as active. Returns the new version.
     uint64_t applyRemoteManifest(const std::string& jsonStr);
 
+    // Phase GraphTurbogenesis: wire methods for opaque-payload envelope.
+
+    // Serialize the current manifest to msgpack wire bytes (tag 0x01).
+    std::vector<uint8_t> manifestBytes() const;
+
+    // Serialize current manifest + graphstream delta to hybrid wire bytes (tag 0x02).
+    std::vector<uint8_t> manifestBytesWithGraphstreamDelta(
+        uint64_t journalSeq, const std::string& segmentPrefix) const;
+
+    // Decode wire bytes (pure or hybrid) and apply the manifest.
+    // Returns hybrid fields if present: (journal_seq, segment_prefix).
+    std::pair<uint64_t, std::string> setManifestBytes(const std::vector<uint8_t>& bytes);
+
     // Expose S3 client for I/O counters (benchmarking).
     S3Client& s3() { return *s3_; }
 

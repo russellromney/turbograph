@@ -64,6 +64,20 @@ struct Manifest {
 
     std::string toJSON() const;
     static std::optional<Manifest> fromJSON(const std::string& json);
+
+    // Phase GraphTurbogenesis: msgpack wire serialization.
+    std::vector<uint8_t> toMsgpack() const;
+    static std::optional<Manifest> fromMsgpack(const std::vector<uint8_t>& bytes);
+};
+
+// Hybrid payload: turbograph manifest + graphstream delta position.
+// Used when turbograph is paired with graphstream journal shipping.
+struct HybridPayload {
+    Manifest turbograph;
+    uint64_t graphstream_journal_seq = 0;
+    std::string graphstream_segment_prefix;
+    std::vector<uint8_t> toMsgpack() const;
+    static std::optional<HybridPayload> fromMsgpack(const std::vector<uint8_t>& bytes);
 };
 
 } // namespace tiered
