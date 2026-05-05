@@ -24,6 +24,16 @@ add_test(NAME PageBitmapTest COMMAND test_page_bitmap)
 add_executable(test_page_io test_page_io.cpp)
 add_test(NAME PageIOTest COMMAND test_page_io)
 
+# Spike: graph pages persisted as rows in SQLite, optionally through a SQLite VFS.
+add_executable(test_sqlite_page_store test_sqlite_page_store.cpp)
+target_link_libraries(test_sqlite_page_store PRIVATE turbograph)
+add_test(NAME SqlitePageStoreTest COMMAND test_sqlite_page_store)
+
+# Spike: Ladybug/Kuzu FileSystem facade over the SQLite page store.
+add_executable(test_sqlite_graph_file_system test_sqlite_graph_file_system.cpp)
+target_link_libraries(test_sqlite_graph_file_system PRIVATE turbograph)
+add_test(NAME SqliteGraphFileSystemTest COMMAND test_sqlite_graph_file_system)
+
 # Unit test: prefetch logic (pure math)
 add_executable(test_prefetch test_prefetch.cpp)
 target_link_libraries(test_prefetch PRIVATE turbograph)

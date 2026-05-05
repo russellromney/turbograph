@@ -7,5 +7,6 @@
 // If lbug_zstd namespace exists (ladybug-fork vendored build), import it.
 // The vendored zstd.h wraps all symbols in namespace lbug_zstd {}.
 #ifdef LBUG_ZSTD_NAMESPACE
+namespace lbug_zstd {}
 using namespace lbug_zstd;
 #endif

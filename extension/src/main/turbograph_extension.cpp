@@ -6,12 +6,15 @@
 #include "main/client_context.h"
 #include "main/database.h"
 #include "main/turbograph_functions.h"
+#include "sqlite_graph_file_system.h"
 #include "tiered_file_system.h"
 #include "function/function.h"
 #include "function/scalar_function.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <optional>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -206,6 +209,30 @@ static std::string envFirst(std::initializer_list<const char*> names) {
     return "";
 }
 
+static std::optional<uint32_t> envU32(const char* name) {
+    auto value = envFirst({name});
+    if (value.empty()) return std::nullopt;
+    try {
+        auto parsed = std::stoul(value);
+        if (parsed > UINT32_MAX) return std::nullopt;
+        return static_cast<uint32_t>(parsed);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static std::optional<int32_t> envI32(const char* name) {
+    auto value = envFirst({name});
+    if (value.empty()) return std::nullopt;
+    try {
+        auto parsed = std::stol(value);
+        if (parsed < INT32_MIN || parsed > INT32_MAX) return std::nullopt;
+        return static_cast<int32_t>(parsed);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 static void applyEnvFallbacks(tiered::TieredConfig& cfg) {
     if (cfg.s3.accessKey.empty()) {
         cfg.s3.accessKey = envFirst({
@@ -279,9 +306,41 @@ static void registerExtensionOptions(main::Database* db) {
     db->addExtensionOption("turbograph_cache_dir", common::LogicalTypeID::STRING,
         common::Value{std::string("")});
 
+    // Matryoshka spike: store graph data-file pages inside a SQLite DB.
+    // Env-only during static extension load is still the important path,
+    // because non-memory databases need the filesystem before data.kz opens.
+    db->addExtensionOption("turbograph_sqlite_page_store", common::LogicalTypeID::STRING,
+        common::Value{std::string("")});
+    db->addExtensionOption("turbograph_sqlite_vfs", common::LogicalTypeID::STRING,
+        common::Value{std::string("")});
+    db->addExtensionOption("turbograph_sqlite_load_extension", common::LogicalTypeID::STRING,
+        common::Value{std::string("")});
+    db->addExtensionOption("turbograph_sqlite_synchronous", common::LogicalTypeID::STRING,
+        common::Value{std::string("NORMAL")});
+    db->addExtensionOption("turbograph_sqlite_wal_autocheckpoint",
+        common::LogicalTypeID::INT64, common::Value{static_cast<int64_t>(1000)});
+    db->addExtensionOption("turbograph_sqlite_cache_size_pages",
+        common::LogicalTypeID::INT64, common::Value{static_cast<int64_t>(0)});
+
     // Encryption key (hex-encoded 64-char string, confidential).
     db->addExtensionOption("turbograph_encryption_key", common::LogicalTypeID::STRING,
         common::Value{std::string("")}, true);
+}
+
+static std::string getSettingString(main::ClientContext* context, const char* name) {
+    try {
+        return context->getCurrentSetting(name).getValue<std::string>();
+    } catch (...) {
+        return "";
+    }
+}
+
+static std::optional<int64_t> getSettingI64(main::ClientContext* context, const char* name) {
+    try {
+        return context->getCurrentSetting(name).getValue<int64_t>();
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 void TurbographExtension::load(main::ClientContext* context) {
@@ -298,16 +357,53 @@ void TurbographExtension::load(main::ClientContext* context) {
     // before lbug opens the database file we need to intercept.
     applyEnvFallbacks(cfg);
 
+    auto sqlitePageStore = getSettingString(context, "turbograph_sqlite_page_store");
+    if (sqlitePageStore.empty()) {
+        sqlitePageStore = envFirst({"TURBOGRAPH_SQLITE_PAGE_STORE"});
+    }
+    auto sqliteVfs = getSettingString(context, "turbograph_sqlite_vfs");
+    if (sqliteVfs.empty()) {
+        sqliteVfs = envFirst({"TURBOGRAPH_SQLITE_VFS"});
+    }
+    auto sqliteLoadExtension = getSettingString(context, "turbograph_sqlite_load_extension");
+    if (sqliteLoadExtension.empty()) {
+        sqliteLoadExtension = envFirst({"TURBOGRAPH_SQLITE_LOAD_EXTENSION"});
+    }
+    auto sqlitePageSize = envU32("TURBOGRAPH_SQLITE_PAGE_SIZE").value_or(0);
+    auto sqliteWalAutoCheckpointPages =
+        static_cast<uint32_t>(getSettingI64(context,
+            "turbograph_sqlite_wal_autocheckpoint").value_or(1000));
+    if (auto envValue = envU32("TURBOGRAPH_SQLITE_WAL_AUTOCHECKPOINT")) {
+        sqliteWalAutoCheckpointPages = *envValue;
+    }
+    auto sqliteCacheSizePages =
+        static_cast<int32_t>(getSettingI64(context,
+            "turbograph_sqlite_cache_size_pages").value_or(0));
+    if (auto envValue = envI32("TURBOGRAPH_SQLITE_CACHE_SIZE_PAGES")) {
+        sqliteCacheSizePages = *envValue;
+    }
+    auto sqliteSynchronous = getSettingString(context, "turbograph_sqlite_synchronous");
+    if (auto envValue = envFirst({"TURBOGRAPH_SQLITE_SYNCHRONOUS"}); !envValue.empty()) {
+        sqliteSynchronous = envValue;
+    }
+    if (sqliteSynchronous.empty()) sqliteSynchronous = "NORMAL";
+
     if (std::getenv("TURBOGRAPH_DEBUG_CONFIG")) {
         std::fprintf(stderr,
-            "turbograph config: access=%s secret=%s endpoint=%s bucket=%s prefix=%s data_file=%s cache_dir=%s\n",
+            "turbograph config: access=%s secret=%s endpoint=%s bucket=%s prefix=%s data_file=%s cache_dir=%s sqlite_store=%s sqlite_vfs=%s sqlite_page_size=%u sqlite_wal_autocheckpoint=%u sqlite_cache_size_pages=%d sqlite_synchronous=%s\n",
             cfg.s3.accessKey.empty() ? "missing" : "set",
             cfg.s3.secretKey.empty() ? "missing" : "set",
             cfg.s3.endpoint.empty() ? "missing" : cfg.s3.endpoint.c_str(),
             cfg.s3.bucket.empty() ? "missing" : cfg.s3.bucket.c_str(),
             cfg.s3.prefix.empty() ? "missing" : cfg.s3.prefix.c_str(),
             cfg.dataFilePath.empty() ? "missing" : cfg.dataFilePath.c_str(),
-            cfg.cacheDir.empty() ? "missing" : cfg.cacheDir.c_str());
+            cfg.cacheDir.empty() ? "missing" : cfg.cacheDir.c_str(),
+            sqlitePageStore.empty() ? "missing" : sqlitePageStore.c_str(),
+            sqliteVfs.empty() ? "default" : sqliteVfs.c_str(),
+            sqlitePageSize,
+            sqliteWalAutoCheckpointPages,
+            sqliteCacheSizePages,
+            sqliteSynchronous.c_str());
     }
 
     // Parse encryption key from env var or extension option.
@@ -332,7 +428,22 @@ void TurbographExtension::load(main::ClientContext* context) {
     // registrations; the UDFs must continue to point at the filesystem that
     // actually intercepted the database file.
     tiered::TieredFileSystem* activeTfs = registeredTfs(db);
-    if (!activeTfs && !cfg.s3.accessKey.empty() && !cfg.dataFilePath.empty()) {
+    if (!activeTfs && !sqlitePageStore.empty() && !cfg.dataFilePath.empty()) {
+        tiered::SqliteGraphFileSystemConfig sqliteCfg;
+        sqliteCfg.sqlitePath = sqlitePageStore;
+        sqliteCfg.dataFilePath = cfg.dataFilePath;
+        sqliteCfg.graphPageSize = 4096;
+        sqliteCfg.sqlitePageSize = sqlitePageSize;
+        sqliteCfg.sqliteWalAutoCheckpointPages = sqliteWalAutoCheckpointPages;
+        sqliteCfg.sqliteCacheSizePages = sqliteCacheSizePages;
+        sqliteCfg.sqliteSynchronous = sqliteSynchronous;
+        if (!sqliteVfs.empty()) sqliteCfg.sqliteVfsName = sqliteVfs;
+        if (!sqliteLoadExtension.empty()) {
+            sqliteCfg.sqliteLoadableExtensionPath = sqliteLoadExtension;
+        }
+        db->registerFileSystem(std::make_unique<tiered::SqliteGraphFileSystem>(
+            std::move(sqliteCfg)));
+    } else if (!activeTfs && !cfg.s3.accessKey.empty() && !cfg.dataFilePath.empty()) {
         auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
         activeTfs = tfsPtr.get();
         db->registerFileSystem(std::move(tfsPtr));
@@ -345,8 +456,8 @@ void TurbographExtension::load(main::ClientContext* context) {
     // Register the raw metadata parser callback on the TFS.
     // This runs during openFile() after structural pages are fetched,
     // building a page-to-table map for per-table prefetch scheduling.
-    if (tfs) {
-        tfs->setMetadataParser([](const uint8_t* data, size_t len) {
+    if (activeTfs) {
+        activeTfs->setMetadataParser([](const uint8_t* data, size_t len) {
             return parseMetadataPages(data, len);
         });
     }

@@ -8,11 +8,15 @@
 //        TIGRIS_STORAGE_ENDPOINT=... ./cypher_bench
 
 #include "tiered_file_system.h"
+#include "sqlite_graph_file_system.h"
 #include "table_page_map.h"
 #include "main/turbograph_functions.h"
 
 #include "main/connection.h"
 #include "main/database.h"
+#include "main/db_config.h"
+#include "storage/buffer_manager/buffer_manager.h"
+#include "storage/storage_utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,11 +26,36 @@
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
+#include <sqlite3.h>
+
 using Clock = std::chrono::steady_clock;
+
+namespace lbug::testing {
+
+class BaseGraphTest {
+public:
+    static std::unique_ptr<main::Database> constructDB(std::string_view databasePath,
+        main::SystemConfig systemConfig, main::Database::construct_bm_func_t constructFunc) {
+        return std::unique_ptr<main::Database>(
+            new main::Database(databasePath, systemConfig, std::move(constructFunc)));
+    }
+
+    static const std::string& getDatabasePath(const main::Database& database) {
+        return database.databasePath;
+    }
+
+    static const main::DBConfig& getDBConfig(const main::Database& database) {
+        return *database.dbConfig;
+    }
+};
+
+} // namespace lbug::testing
 
 // --- Configuration ---
 
@@ -38,6 +67,59 @@ struct BenchConfig {
     int warmIterations = 3;
     int coldIterations = 2;
 };
+
+enum class StorageMode {
+    TieredTigris,
+    LocalFile,
+    Sqlite,
+    Turbolite,
+    TurboliteS3,
+};
+
+static StorageMode parseStorageMode(int argc, char** argv) {
+    if (argc <= 2) return StorageMode::TieredTigris;
+    if (std::strcmp(argv[2], "local") == 0) return StorageMode::LocalFile;
+    if (std::strcmp(argv[2], "sqlite") == 0) return StorageMode::Sqlite;
+    if (std::strcmp(argv[2], "turbolite") == 0) return StorageMode::Turbolite;
+    if (std::strcmp(argv[2], "turbolite-s3") == 0) return StorageMode::TurboliteS3;
+    return StorageMode::TieredTigris;
+}
+
+static const char* modeName(StorageMode mode) {
+    switch (mode) {
+    case StorageMode::TieredTigris: return "TIERED_TIGRIS";
+    case StorageMode::LocalFile: return "LOCAL";
+    case StorageMode::Sqlite: return "SQLITE_PAGE_STORE";
+    case StorageMode::Turbolite: return "SQLITE_PAGE_STORE_TURBOLITE_VFS";
+    case StorageMode::TurboliteS3: return "SQLITE_PAGE_STORE_TURBOLITE_S3_VFS";
+    }
+    return "UNKNOWN";
+}
+
+static bool usesTigris(StorageMode mode) {
+    return mode == StorageMode::TieredTigris;
+}
+
+static bool usesSqlitePageStore(StorageMode mode) {
+    return mode == StorageMode::Sqlite || mode == StorageMode::Turbolite ||
+           mode == StorageMode::TurboliteS3;
+}
+
+static std::optional<std::string> envString(const char* name) {
+    auto value = std::getenv(name);
+    if (value == nullptr || std::string(value).empty()) {
+        return std::nullopt;
+    }
+    return std::string(value);
+}
+
+static int envInt(const char* name, int defaultValue) {
+    auto value = std::getenv(name);
+    if (value == nullptr || std::string(value).empty()) {
+        return defaultValue;
+    }
+    return std::atoi(value);
+}
 
 // --- Data Generation ---
 
@@ -358,12 +440,246 @@ static uint64_t pathSize(const std::string& path) {
     return total;
 }
 
+struct TurboliteS3Counters {
+    uint64_t gets = 0;
+    uint64_t getBytes = 0;
+    uint64_t puts = 0;
+    uint64_t putBytes = 0;
+};
+
+class TurboliteSqlMetrics {
+public:
+    explicit TurboliteSqlMetrics(const std::string& extensionPath) {
+        if (sqlite3_open(":memory:", &db_) != SQLITE_OK) {
+            fail("open metrics sqlite connection");
+        }
+        sqlite3_enable_load_extension(db_, 1);
+        auto path = normalizeExtensionPath(extensionPath);
+        char* err = nullptr;
+        auto rc = sqlite3_load_extension(db_, path.c_str(), "sqlite3_turbolite_init", &err);
+        if (rc != SQLITE_OK) {
+            std::string message = err ? err : "unknown error";
+            sqlite3_free(err);
+            fail(("load turbolite metrics extension: " + message).c_str());
+        }
+    }
+
+    ~TurboliteSqlMetrics() {
+        if (db_) sqlite3_close(db_);
+    }
+
+    TurboliteSqlMetrics(const TurboliteSqlMetrics&) = delete;
+    TurboliteSqlMetrics& operator=(const TurboliteSqlMetrics&) = delete;
+
+    void reset() {
+        (void)scalar("SELECT turbolite_reset_s3_counters()");
+    }
+
+    void clearCache(const char* mode) {
+        auto sql = std::string("SELECT turbolite_clear_cache('") + mode + "')";
+        auto rc = scalar(sql.c_str());
+        if (rc != 0) {
+            fail("turbolite_clear_cache failed");
+        }
+    }
+
+    int64_t flushToStorage() {
+        auto start = Clock::now();
+        auto rc = scalar("SELECT turbolite_flush_to_storage()");
+        if (rc != 0) {
+            fail("turbolite_flush_to_storage failed");
+        }
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - start).count();
+    }
+
+    TurboliteS3Counters counters() {
+        TurboliteS3Counters c;
+        c.gets = scalar("SELECT turbolite_s3_gets()");
+        c.getBytes = scalar("SELECT turbolite_s3_bytes()");
+        c.puts = scalar("SELECT turbolite_s3_puts()");
+        c.putBytes = scalar("SELECT turbolite_s3_put_bytes()");
+        return c;
+    }
+
+private:
+    static std::string normalizeExtensionPath(std::string path) {
+#if defined(__APPLE__)
+        const std::string suffix = ".dylib";
+#else
+        const std::string suffix = ".so";
+#endif
+        if (path.size() > suffix.size() &&
+            path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            path.resize(path.size() - suffix.size());
+        }
+        return path;
+    }
+
+    uint64_t scalar(const char* sql) {
+        sqlite3_stmt* stmt = nullptr;
+        auto rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            fail(sqlite3_errmsg(db_));
+        }
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            auto msg = sqlite3_errmsg(db_);
+            sqlite3_finalize(stmt);
+            fail(msg);
+        }
+        auto value = sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
+        return static_cast<uint64_t>(value);
+    }
+
+    [[noreturn]] void fail(const char* message) const {
+        std::fprintf(stderr, "Turbolite metrics error: %s\n", message);
+        std::exit(1);
+    }
+
+    sqlite3* db_ = nullptr;
+};
+
+struct StoragePaths {
+    std::string dbPath;
+    std::string dataDir;
+    std::string cacheDir;
+    std::string sqlitePath;
+    std::string turboliteCacheDir;
+};
+
+static std::unique_ptr<lbug::common::FileSystem> makeSqliteGraphFileSystem(
+    const StoragePaths& paths, StorageMode mode) {
+    lbug::tiered::SqliteGraphFileSystemConfig cfg;
+    cfg.sqlitePath = paths.sqlitePath;
+    cfg.dataFilePath = paths.dbPath;
+    cfg.graphPageSize = 4096;
+    cfg.sqlitePageSize = 65536;
+    cfg.sqliteWalAutoCheckpointPages =
+        std::getenv("TURBOGRAPH_SQLITE_WAL_AUTOCHECKPOINT") ?
+        std::atoi(std::getenv("TURBOGRAPH_SQLITE_WAL_AUTOCHECKPOINT")) : 1000;
+    cfg.sqliteCacheSizePages =
+        std::getenv("TURBOGRAPH_SQLITE_CACHE_SIZE_PAGES") ?
+        std::atoi(std::getenv("TURBOGRAPH_SQLITE_CACHE_SIZE_PAGES")) : 0;
+    cfg.sqliteSynchronous = envString("TURBOGRAPH_SQLITE_SYNCHRONOUS").value_or("NORMAL");
+
+    if (mode == StorageMode::Turbolite || mode == StorageMode::TurboliteS3) {
+        auto extension = envString("TURBOGRAPH_TURBOLITE_EXTENSION");
+        if (!extension) {
+            std::fprintf(stderr,
+                "Set TURBOGRAPH_TURBOLITE_EXTENSION for turbolite benchmark modes\n");
+            std::exit(1);
+        }
+        std::filesystem::create_directories(paths.turboliteCacheDir);
+        setenv("TURBOLITE_CACHE_DIR", paths.turboliteCacheDir.c_str(), 1);
+        cfg.sqliteVfsName = mode == StorageMode::TurboliteS3 ? "turbolite-s3" : "turbolite";
+        cfg.sqliteLoadableExtensionPath = *extension;
+    }
+
+    return std::make_unique<lbug::tiered::SqliteGraphFileSystem>(std::move(cfg));
+}
+
+static void addGraphFileSystem(std::vector<std::unique_ptr<lbug::common::FileSystem>>& fsList,
+    const StoragePaths& paths, StorageMode mode, const lbug::tiered::TieredConfig& tieredCfg) {
+    if (mode == StorageMode::TieredTigris) {
+        fsList.push_back(std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg));
+    } else if (usesSqlitePageStore(mode)) {
+        fsList.push_back(makeSqliteGraphFileSystem(paths, mode));
+    }
+}
+
+struct OpenBenchDatabaseResult {
+    std::unique_ptr<lbug::main::Database> db;
+    lbug::tiered::TieredFileSystem* tfs = nullptr;
+    lbug::tiered::S3Client* s3 = nullptr;
+};
+
+static OpenBenchDatabaseResult openBenchDatabase(const StoragePaths& paths, StorageMode mode,
+    const lbug::tiered::TieredConfig& tieredCfg, lbug::main::SystemConfig sysCfg,
+    std::optional<std::string> tieredCacheDir = std::nullopt) {
+    struct Handles {
+        lbug::tiered::TieredFileSystem* tfs = nullptr;
+        lbug::tiered::S3Client* s3 = nullptr;
+    };
+    auto handles = std::make_shared<Handles>();
+
+    auto constructBM = [paths, mode, tieredCfg, tieredCacheDir, handles](
+                           const lbug::main::Database& db) mutable {
+        const auto& expandedDataFilePath = lbug::testing::BaseGraphTest::getDatabasePath(db);
+        const auto& dbConfig = lbug::testing::BaseGraphTest::getDBConfig(db);
+
+        if (mode == StorageMode::TieredTigris) {
+            auto cfg = tieredCfg;
+            cfg.dataFilePath = expandedDataFilePath;
+            if (tieredCacheDir) {
+                cfg.cacheDir = *tieredCacheDir;
+            }
+            auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(cfg);
+            tfs->setMetadataParser(lbug::turbograph_extension::parseMetadataPages);
+            handles->tfs = tfs.get();
+            handles->s3 = &tfs->s3();
+            const_cast<lbug::main::Database&>(db).registerFileSystem(std::move(tfs));
+        } else if (usesSqlitePageStore(mode)) {
+            auto fs = makeSqliteGraphFileSystem(paths, mode);
+            const_cast<lbug::main::Database&>(db).registerFileSystem(std::move(fs));
+        }
+
+        return std::make_unique<lbug::storage::BufferManager>(expandedDataFilePath,
+            lbug::storage::StorageUtils::getTmpFilePath(expandedDataFilePath),
+            dbConfig.bufferPoolSize, dbConfig.maxDBSize,
+            const_cast<lbug::main::Database&>(db).getVFS(), dbConfig.readOnly);
+    };
+
+    OpenBenchDatabaseResult result;
+    result.db = lbug::testing::BaseGraphTest::constructDB(paths.dbPath, sysCfg,
+        std::move(constructBM));
+    result.tfs = handles->tfs;
+    result.s3 = handles->s3;
+    return result;
+}
+
 static void exec(lbug::main::Connection& conn, const char* query) {
     auto r = conn.query(query);
     if (!r->isSuccess()) {
         std::fprintf(stderr, "FAILED: %s\n  %s\n", query, r->getErrorMessage().c_str());
         std::exit(1);
     }
+}
+
+static void runWriteCheckpointCycles(lbug::main::Connection& conn, uint32_t startId,
+    int cycles, int checkpointEvery) {
+    if (cycles <= 0) {
+        return;
+    }
+    if (checkpointEvery <= 0) {
+        checkpointEvery = 1;
+    }
+
+    std::printf("  Repeated write proof: %d writes, checkpoint every %d...\n",
+        cycles, checkpointEvery);
+    auto start = Clock::now();
+    for (int i = 0; i < cycles; i++) {
+        auto id = static_cast<uint64_t>(startId) + static_cast<uint64_t>(i);
+        auto q = std::string("CREATE (:Person {id: ") + std::to_string(id) +
+                 ", name: 'Write Probe " + std::to_string(i) +
+                 "', gender: 'probe', age: " + std::to_string(20 + (i % 50)) +
+                 ", isMarried: false})";
+        exec(conn, q.c_str());
+        if ((i + 1) % checkpointEvery == 0) {
+            exec(conn, "CHECKPOINT");
+        }
+    }
+    if (cycles % checkpointEvery != 0) {
+        exec(conn, "CHECKPOINT");
+    }
+
+    auto verify = std::string("MATCH (p:Person) WHERE p.id >= ") +
+                  std::to_string(startId) + " RETURN count(p)";
+    exec(conn, verify.c_str());
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - start).count();
+    std::printf("  Repeated write proof: passed in %lldms\n", (long long)elapsedMs);
 }
 
 // Published Neo4j 5.11 numbers from kuzudb-study (100K persons, M2 Mac).
@@ -389,34 +705,55 @@ int main(int argc, char** argv) {
     if (argc > 1) cfg.numPersons = std::atoi(argv[1]);
     auto personsEnv = std::getenv("BENCH_PERSONS");
     if (personsEnv) cfg.numPersons = std::atoi(personsEnv);
-    bool localMode = (argc > 2 && std::strcmp(argv[2], "local") == 0);
+    cfg.coldIterations = envInt("BENCH_COLD_ITERATIONS", cfg.coldIterations);
+    cfg.warmIterations = envInt("BENCH_WARM_ITERATIONS", cfg.warmIterations);
+    auto storageMode = parseStorageMode(argc, argv);
+    bool localMode = storageMode == StorageMode::LocalFile;
     if (cfg.followEdges == 0) cfg.followEdges = cfg.numPersons * 10;
 
     auto ak = std::getenv("TIGRIS_STORAGE_ACCESS_KEY_ID");
     auto sk = std::getenv("TIGRIS_STORAGE_SECRET_ACCESS_KEY");
     auto ep = std::getenv("TIGRIS_STORAGE_ENDPOINT");
-    if (!localMode && (!ak || !sk || !ep)) {
-        std::fprintf(stderr, "Set TIGRIS_STORAGE_* env vars (or pass 'local' as 3rd arg)\n");
+    if (usesTigris(storageMode) && (!ak || !sk || !ep)) {
+        std::fprintf(stderr,
+            "Set TIGRIS_STORAGE_* env vars (or pass local/sqlite/turbolite/turbolite-s3 as 3rd arg)\n");
         return 1;
     }
 
     // Deterministic prefix so data persists across runs.
     std::string tag = std::to_string(cfg.numPersons / 1000) + "k";
+    if (auto tagSuffix = envString("BENCH_TAG_SUFFIX")) {
+        tag += "_" + *tagSuffix;
+    }
+    auto modeSuffix = std::string("_") + modeName(storageMode);
+    std::replace(modeSuffix.begin(), modeSuffix.end(), '/', '_');
 
     // Use /data (Fly volume) if it exists, else /tmp.
-    std::string base = std::filesystem::exists("/data") ? "/data" : "/tmp";
-    std::string dbPath = base + "/cypher_bench_" + tag + ".kz";
-    std::string dataDir = base + "/cypher_bench_data_" + tag;
-    std::string cacheDir = base + "/cypher_bench_cache_" + tag;
+    std::string base = envString("BENCH_BASE_DIR").value_or(
+        std::filesystem::exists("/data") ? "/data" : "/tmp");
+    std::filesystem::create_directories(base);
+    StoragePaths paths;
+    paths.dbPath = base + "/cypher_bench_" + tag + modeSuffix + ".kz";
+    paths.dataDir = base + "/cypher_bench_data_" + tag + modeSuffix;
+    paths.cacheDir = base + "/cypher_bench_cache_" + tag + modeSuffix;
+    paths.sqlitePath = base + "/cypher_bench_pages_" + tag + modeSuffix + ".sqlite";
+    paths.turboliteCacheDir = base + "/cypher_bench_turbolite_cache_" + tag + modeSuffix;
 
-    bool dbExists = std::filesystem::exists(dbPath);
-    std::printf("  DB path: %s (%s)\n", dbPath.c_str(), dbExists ? "exists" : "new");
+    bool dbExists = std::filesystem::exists(paths.dbPath);
+    if (usesSqlitePageStore(storageMode)) {
+        dbExists = std::filesystem::exists(paths.sqlitePath);
+    }
+    std::printf("  Mode: %s\n", modeName(storageMode));
+    std::printf("  DB path: %s (%s)\n", paths.dbPath.c_str(), dbExists ? "exists" : "new");
+    if (usesSqlitePageStore(storageMode)) {
+        std::printf("  SQLite page store: %s\n", paths.sqlitePath.c_str());
+    }
 
     lbug::tiered::TieredConfig tieredCfg;
-    if (!localMode) {
+    if (usesTigris(storageMode)) {
         tieredCfg.s3 = {ep, "cinch-data", "bench/cypher/v2/" + tag, "auto", ak, sk};
-        tieredCfg.dataFilePath = dbPath;
-        tieredCfg.cacheDir = cacheDir;
+        tieredCfg.dataFilePath = paths.dbPath;
+        tieredCfg.cacheDir = paths.cacheDir;
         tieredCfg.pageSize = 4096;
         // Prefetch schedules: PREFETCH_SCAN, PREFETCH_LOOKUP env vars
         // (comma-separated floats). Defaults: scan=0.3,0.3,0.4  lookup=0,0,0
@@ -469,9 +806,13 @@ int main(int argc, char** argv) {
     if (!dbExists) {
         // Clean up ALL stale local artifacts from previous crashed runs
         // (DB dir, cache dir, CSV data dir, shadow files, WAL files, etc.).
-        std::filesystem::remove_all(dbPath);
-        std::filesystem::remove_all(cacheDir);
-        std::filesystem::remove_all(dataDir);
+        std::filesystem::remove_all(paths.dbPath);
+        std::filesystem::remove_all(paths.cacheDir);
+        std::filesystem::remove_all(paths.dataDir);
+        std::filesystem::remove(paths.sqlitePath);
+        std::filesystem::remove(paths.sqlitePath + "-wal");
+        std::filesystem::remove(paths.sqlitePath + "-shm");
+        std::filesystem::remove_all(paths.turboliteCacheDir);
         for (auto& entry : std::filesystem::directory_iterator(base)) {
             auto name = entry.path().filename().string();
             if (name.find("cypher_bench") != std::string::npos && name.find(tag) != std::string::npos) {
@@ -482,7 +823,7 @@ int main(int argc, char** argv) {
         // In tiered mode, unconditionally clean up ALL Tigris objects at this prefix.
         // The Kuzu catalog (node/rel table defs) lives on local disk and doesn't
         // survive container restarts, so we must load fresh every time.
-        if (!localMode) {
+        if (usesTigris(storageMode)) {
             lbug::tiered::S3Client s3(tieredCfg.s3);
 
             // Delete manifest explicitly by key (listObjects has SigV4 issues).
@@ -508,22 +849,28 @@ int main(int argc, char** argv) {
         std::printf("  Generating data (%u persons, %u follow edges)...\n",
             cfg.numPersons, cfg.followEdges);
         auto genStart = Clock::now();
-        generateCSVData(dataDir, cfg);
+        generateCSVData(paths.dataDir, cfg);
         auto genMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - genStart).count();
         std::printf("  Data generation: %lldms\n", (long long)genMs);
 
-        std::printf("  Creating database (%s mode)...\n", localMode ? "LOCAL" : "TIERED");
-
-        std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
-        if (!localMode) {
-            fsList.push_back(std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg));
-        }
+        std::printf("  Creating database (%s mode)...\n", modeName(storageMode));
 
         lbug::main::SystemConfig sysCfg;
         sysCfg.bufferPoolSize = bufferPoolBytes;
-        lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
-        lbug::main::Connection conn(&db);
+        if (usesSqlitePageStore(storageMode)) {
+            sysCfg.autoCheckpoint = true;
+            sysCfg.checkpointThreshold = 0;
+            sysCfg.forceCheckpointOnClose = false;
+        }
+        auto openDb = openBenchDatabase(paths, storageMode, tieredCfg, sysCfg);
+        std::unique_ptr<TurboliteSqlMetrics> turboliteMetrics;
+        if (storageMode == StorageMode::TurboliteS3) {
+            turboliteMetrics = std::make_unique<TurboliteSqlMetrics>(
+                envString("TURBOGRAPH_TURBOLITE_EXTENSION").value());
+            turboliteMetrics->reset();
+        }
+        lbug::main::Connection conn(openDb.db.get());
 
         std::printf("  Creating schema...\n");
         exec(conn, "CREATE NODE TABLE Person(id INT64, name STRING, gender STRING, "
@@ -539,7 +886,7 @@ int main(int argc, char** argv) {
         auto loadStart = Clock::now();
 
         auto copyCmd = [&](const char* table, const char* file) {
-            auto q = std::string("COPY ") + table + " FROM '" + dataDir + "/" + file + "'";
+            auto q = std::string("COPY ") + table + " FROM '" + paths.dataDir + "/" + file + "'";
             exec(conn, q.c_str());
         };
         copyCmd("Person", "persons.csv");
@@ -553,27 +900,85 @@ int main(int argc, char** argv) {
             Clock::now() - loadStart).count();
         std::printf("  Data loaded in %lldms\n", (long long)loadMs);
 
-        std::printf("  Checkpointing%s...\n", localMode ? "" : " (flushing to Tigris)");
+        std::printf("  Checkpointing%s...\n",
+            usesTigris(storageMode) ? " (flushing to Tigris)" : "");
         auto ckptStart = Clock::now();
         exec(conn, "CHECKPOINT");
         ckptMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - ckptStart).count();
         std::printf("  Checkpoint: %lldms\n", (long long)ckptMs);
 
+        if (turboliteMetrics) {
+            std::printf("  Flushing turbolite staging to object storage...\n");
+            auto flushMs = turboliteMetrics->flushToStorage();
+            auto c = turboliteMetrics->counters();
+            std::printf("  Turbolite flush: %lldms  s3-get=%llu/%lluKB  s3-put=%llu/%lluKB\n",
+                (long long)flushMs,
+                (unsigned long long)c.gets, (unsigned long long)(c.getBytes / 1024),
+                (unsigned long long)c.puts, (unsigned long long)(c.putBytes / 1024));
+        }
+
         // Measure total data size: dbPath (metadata) + cacheDir (tiered pages).
-        if (std::filesystem::exists(dbPath))
-            dbSizeBytes += pathSize(dbPath);
-        if (std::filesystem::exists(cacheDir))
-            dbSizeBytes += pathSize(cacheDir);
+        if (std::filesystem::exists(paths.dbPath))
+            dbSizeBytes += pathSize(paths.dbPath);
+        if (std::filesystem::exists(paths.cacheDir))
+            dbSizeBytes += pathSize(paths.cacheDir);
+        if (std::filesystem::exists(paths.sqlitePath))
+            dbSizeBytes += pathSize(paths.sqlitePath);
+        if (std::filesystem::exists(paths.turboliteCacheDir))
+            dbSizeBytes += pathSize(paths.turboliteCacheDir);
 
         // Clean up CSV data.
-        std::filesystem::remove_all(dataDir);
+        std::filesystem::remove_all(paths.dataDir);
     } else {
         std::printf("  Reusing existing DB (skipping data generation + load).\n");
-        if (std::filesystem::exists(dbPath))
-            dbSizeBytes += pathSize(dbPath);
-        if (std::filesystem::exists(cacheDir))
-            dbSizeBytes += pathSize(cacheDir);
+        if (std::filesystem::exists(paths.dbPath))
+            dbSizeBytes += pathSize(paths.dbPath);
+        if (std::filesystem::exists(paths.cacheDir))
+            dbSizeBytes += pathSize(paths.cacheDir);
+        if (std::filesystem::exists(paths.sqlitePath))
+            dbSizeBytes += pathSize(paths.sqlitePath);
+        if (std::filesystem::exists(paths.turboliteCacheDir))
+            dbSizeBytes += pathSize(paths.turboliteCacheDir);
+    }
+
+    // Closing the graph DB can force one last SQLite/VFS sync after the load
+    // block's explicit flush. Drain that before any cold-cache eviction.
+    if (storageMode == StorageMode::TurboliteS3) {
+        TurboliteSqlMetrics finalMetrics(envString("TURBOGRAPH_TURBOLITE_EXTENSION").value());
+        finalMetrics.reset();
+        auto flushMs = finalMetrics.flushToStorage();
+        auto c = finalMetrics.counters();
+        if (flushMs > 0 || c.puts > 0 || c.gets > 0) {
+            std::printf("  Turbolite final flush: %lldms  s3-get=%llu/%lluKB  s3-put=%llu/%lluKB\n",
+                (long long)flushMs,
+                (unsigned long long)c.gets, (unsigned long long)(c.getBytes / 1024),
+                (unsigned long long)c.puts, (unsigned long long)(c.putBytes / 1024));
+        }
+    }
+
+    auto writeCycles = envInt("BENCH_WRITE_CYCLES", 0);
+    if (writeCycles > 0) {
+        lbug::main::SystemConfig writeSysCfg;
+        writeSysCfg.bufferPoolSize = bufferPoolBytes;
+        writeSysCfg.autoCheckpoint = true;
+        writeSysCfg.checkpointThreshold = 0;
+        writeSysCfg.forceCheckpointOnClose = false;
+        auto db = openBenchDatabase(paths, storageMode, tieredCfg, writeSysCfg);
+        lbug::main::Connection conn(db.db.get());
+        runWriteCheckpointCycles(conn, cfg.numPersons,
+            writeCycles, envInt("BENCH_WRITE_CHECKPOINT_EVERY", 1));
+    }
+
+    if (storageMode == StorageMode::TurboliteS3 && writeCycles > 0) {
+        TurboliteSqlMetrics writeMetrics(envString("TURBOGRAPH_TURBOLITE_EXTENSION").value());
+        writeMetrics.reset();
+        auto flushMs = writeMetrics.flushToStorage();
+        auto c = writeMetrics.counters();
+        std::printf("  Turbolite write-cycle flush: %lldms  s3-get=%llu/%lluKB  s3-put=%llu/%lluKB\n",
+            (long long)flushMs,
+            (unsigned long long)c.gets, (unsigned long long)(c.getBytes / 1024),
+            (unsigned long long)c.puts, (unsigned long long)(c.putBytes / 1024));
     }
 
     // In tiered mode, report actual data size from manifest page count.
@@ -598,12 +1003,18 @@ int main(int argc, char** argv) {
     LatencyStats interiorStats[NUM_QUERIES];
     LatencyStats indexStats[NUM_QUERIES];
     LatencyStats warmStats[NUM_QUERIES];
+    std::unique_ptr<TurboliteSqlMetrics> queryTurboliteMetrics;
+    if (storageMode == StorageMode::TurboliteS3) {
+        queryTurboliteMetrics = std::make_unique<TurboliteSqlMetrics>(
+            envString("TURBOGRAPH_TURBOLITE_EXTENSION").value());
+    }
 
     auto runQuery = [&](lbug::main::Database& db, lbug::tiered::S3Client* s3Ptr,
         lbug::tiered::TieredFileSystem* tfs,
         int q, int iter, const char* label, LatencyStats* stats) {
         try {
             if (s3Ptr) s3Ptr->resetCounters();
+            if (queryTurboliteMetrics) queryTurboliteMetrics->reset();
             if (tfs) tfs->setActiveSchedule(QUERIES[q].schedule);
             lbug::main::Connection conn(&db);
 
@@ -622,6 +1033,11 @@ int main(int argc, char** argv) {
             }
             uint64_t s3Reqs = s3Ptr ? s3Ptr->fetchCount.load() : 0;
             uint64_t s3Bytes = s3Ptr ? s3Ptr->fetchBytes.load() : 0;
+            if (queryTurboliteMetrics) {
+                auto c = queryTurboliteMetrics->counters();
+                s3Reqs = c.gets;
+                s3Bytes = c.getBytes;
+            }
             stats[q].samples.push_back(us);
             std::printf("    [%-8s] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
                 label, iter, QUERIES[q].name, (long long)(us / 1000),
@@ -640,28 +1056,26 @@ int main(int argc, char** argv) {
     for (int iter = 0; iter < cfg.coldIterations; iter++) {
         for (int q = 0; q < NUM_QUERIES; q++) {
             try {
-                auto coldCacheDir = cacheDir + "_cold_" + std::to_string(iter) + "_" + std::to_string(q);
+                auto coldCacheDir = paths.cacheDir + "_cold_" + std::to_string(iter) + "_" +
+                                    std::to_string(q);
                 std::filesystem::remove_all(coldCacheDir);
 
                 lbug::tiered::S3Client* coldS3 = nullptr;
                 lbug::tiered::TieredFileSystem* coldTfsPtr = nullptr;
-                std::vector<std::unique_ptr<lbug::common::FileSystem>> coldFsList;
-                if (!localMode) {
-                    auto coldCfg = tieredCfg;
-                    coldCfg.cacheDir = coldCacheDir;
-                    auto coldTfs = std::make_unique<lbug::tiered::TieredFileSystem>(coldCfg);
-                    coldTfs->setMetadataParser(lbug::turbograph_extension::parseMetadataPages);
-                    coldTfsPtr = coldTfs.get();
-                    coldS3 = &coldTfs->s3();
-                    coldS3->resetCounters();
-                    coldFsList.push_back(std::move(coldTfs));
-                }
                 lbug::main::SystemConfig coldSysCfg;
                 coldSysCfg.bufferPoolSize = bufferPoolBytes;
                 coldSysCfg.forceCheckpointOnClose = false;
                 coldSysCfg.autoCheckpoint = false;
-                lbug::main::Database coldDb(dbPath, coldSysCfg, std::move(coldFsList));
-                lbug::main::Connection conn(&coldDb);
+                auto coldDb = openBenchDatabase(paths, storageMode, tieredCfg, coldSysCfg,
+                    coldCacheDir);
+                coldTfsPtr = coldDb.tfs;
+                coldS3 = coldDb.s3;
+                if (coldS3) coldS3->resetCounters();
+                if (queryTurboliteMetrics) {
+                    queryTurboliteMetrics->clearCache("all");
+                    queryTurboliteMetrics->reset();
+                }
+                lbug::main::Connection conn(coldDb.db.get());
 
                 // Frontrun prefetch before query execution.
                 auto submitted = frontrunPrefetch(conn, coldTfsPtr, QUERIES[q].cypher);
@@ -680,6 +1094,11 @@ int main(int argc, char** argv) {
                 }
                 uint64_t s3Reqs = coldS3 ? coldS3->fetchCount.load() : 0;
                 uint64_t s3Bytes = coldS3 ? coldS3->fetchBytes.load() : 0;
+                if (queryTurboliteMetrics) {
+                    auto c = queryTurboliteMetrics->counters();
+                    s3Reqs = c.gets;
+                    s3Bytes = c.getBytes;
+                }
                 coldStats[q].samples.push_back(us);
                 std::printf("    [%-8s] iter=%d %s: %lldms  s3=%llu/%lluKB\n",
                     "cold", iter, QUERIES[q].name, (long long)(us / 1000),
@@ -694,25 +1113,14 @@ int main(int argc, char** argv) {
 
     // --- Shared TFS + DB for interior/index/warm ---
     {
-        std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
-        lbug::tiered::TieredFileSystem* tfsPtr = nullptr;
-        lbug::tiered::S3Client* s3Ptr = nullptr;
-        if (!localMode) {
-            auto tfs = std::make_unique<lbug::tiered::TieredFileSystem>(tieredCfg);
-            tfs->setMetadataParser(lbug::turbograph_extension::parseMetadataPages);
-            tfsPtr = tfs.get();
-            s3Ptr = &tfs->s3();
-            fsList.push_back(std::move(tfs));
-        }
         lbug::main::SystemConfig sysCfg;
         sysCfg.bufferPoolSize = bufferPoolBytes;
         sysCfg.forceCheckpointOnClose = false;
         sysCfg.autoCheckpoint = false;
 
-        // Track structural pages during Database construction.
-        if (tfsPtr) tfsPtr->beginTrackStructural();
-        lbug::main::Database db(dbPath, sysCfg, std::move(fsList));
-        if (tfsPtr) tfsPtr->endTrack();
+        auto db = openBenchDatabase(paths, storageMode, tieredCfg, sysCfg);
+        auto tfsPtr = db.tfs;
+        auto s3Ptr = db.s3;
 
         std::printf("  Per-table prefetch: %s\n",
             (tfsPtr && tfsPtr->hasTablePageMap()) ? "active" : "inactive");
@@ -721,7 +1129,7 @@ int main(int argc, char** argv) {
         if (tfsPtr) tfsPtr->beginTrackIndex();
         std::printf("  Warmup (tracking index pages)...\n");
         {
-            lbug::main::Connection conn(&db);
+            lbug::main::Connection conn(db.db.get());
             for (int q = 0; q < NUM_QUERIES; q++) {
                 auto r = conn.query(QUERIES[q].cypher);
                 if (!r->isSuccess()) {
@@ -736,7 +1144,7 @@ int main(int argc, char** argv) {
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
             if (tfsPtr) tfsPtr->clearCacheKeepStructural();
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, tfsPtr, q, iter, "interior", interiorStats);
+                runQuery(*db.db, s3Ptr, tfsPtr, q, iter, "interior", interiorStats);
             }
         }
 
@@ -747,21 +1155,21 @@ int main(int argc, char** argv) {
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
             if (tfsPtr) tfsPtr->clearCacheKeepIndex();
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, tfsPtr, q, iter, "index", indexStats);
+                runQuery(*db.db, s3Ptr, tfsPtr, q, iter, "index", indexStats);
             }
         }
 
         // --- WARM (everything cached, nuke buffer pool via Connection close) ---
         for (int iter = 0; iter < cfg.warmIterations; iter++) {
             for (int q = 0; q < NUM_QUERIES; q++) {
-                runQuery(db, s3Ptr, tfsPtr, q, iter, "warm", warmStats);
+                runQuery(*db.db, s3Ptr, tfsPtr, q, iter, "warm", warmStats);
             }
         }
     }
 
     // Results table.
     std::printf("\n=== Cypher Benchmark — %s (kuzudb-study) ===\n",
-        localMode ? "LOCAL" : "TIERED");
+        modeName(storageMode));
     std::printf("  Persons: %u  Follow edges: %u\n", cfg.numPersons, cfg.followEdges);
     std::printf("  Local disk size: %lluMB  Buffer pool: %lluMB\n",
         (unsigned long long)(dbSizeBytes / (1024 * 1024)),

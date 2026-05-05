@@ -36,16 +36,29 @@ if(NOT LBUG_LIBS)
     message(FATAL_ERROR "No .a files found in ${LADYBUG_DIR}/build/. Build LadybugDB first.")
 endif()
 
-# Link against the full LadybugDB library + all its dependencies.
-# Use --start-group/--end-group to resolve circular deps between static archives
-# (e.g., brotlidec -> brotlicommon, parquet -> thrift -> zstd).
-target_link_libraries(cypher_bench PRIVATE
-    turbograph
-    -Wl,--start-group
-    ${LBUG_LIBS}
-    -Wl,--end-group
-    ${OPENSSL_LIBRARIES}
-    ${ZSTD_LIBRARIES}
-    atomic
-    dl
-    pthread)
+target_compile_definitions(cypher_bench PRIVATE LBUG_ZSTD_NAMESPACE)
+
+if(APPLE)
+    target_link_libraries(cypher_bench PRIVATE
+        turbograph
+        ${LBUG_LIBS}
+        ${OPENSSL_LIBRARIES}
+        ${ZSTD_LIBRARIES}
+        SQLite::SQLite3
+        pthread)
+else()
+    # Link against the full LadybugDB library + all its dependencies.
+    # Use --start-group/--end-group to resolve circular deps between static archives
+    # (e.g., brotlidec -> brotlicommon, parquet -> thrift -> zstd).
+    target_link_libraries(cypher_bench PRIVATE
+        turbograph
+        -Wl,--start-group
+        ${LBUG_LIBS}
+        -Wl,--end-group
+        ${OPENSSL_LIBRARIES}
+        ${ZSTD_LIBRARIES}
+        SQLite::SQLite3
+        atomic
+        dl
+        pthread)
+endif()

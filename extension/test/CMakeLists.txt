@@ -7,7 +7,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 enable_testing()
 
+option(TURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION
+    "Enable sqlite3_load_extension support for loading the turbolite VFS" OFF)
+
+if(APPLE AND EXISTS "/opt/homebrew/opt/sqlite")
+    list(PREPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/sqlite")
+endif()
+
 find_package(OpenSSL REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 if(NOT DEFINED httplib_SOURCE_DIR)
     include(FetchContent)
@@ -59,12 +67,19 @@ add_executable(test_turbograph_extension
     ${TURBOGRAPH_ROOT}/src/chunk_codec.cpp
     ${TURBOGRAPH_ROOT}/src/manifest.cpp
     ${TURBOGRAPH_ROOT}/src/page_bitmap.cpp
+    ${TURBOGRAPH_ROOT}/src/sqlite_graph_file_system.cpp
+    ${TURBOGRAPH_ROOT}/src/sqlite_page_store.cpp
     ${TURBOGRAPH_ROOT}/src/table_page_map.cpp
     ${TURBOGRAPH_ROOT}/src/crypto.cpp
     ${TURBOGRAPH_ROOT}/src/tiered_file_system.cpp)
 
 target_compile_definitions(test_turbograph_extension PRIVATE
     CPPHTTPLIB_OPENSSL_SUPPORT LBUG_ZSTD_NAMESPACE)
+
+if(TURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION)
+    target_compile_definitions(test_turbograph_extension PRIVATE
+        TURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION)
+endif()
 
 # LadybugDB headers BEFORE turbograph includes so real headers win over stubs.
 # Do NOT include stubs/ here.
@@ -89,6 +104,7 @@ target_link_libraries(test_turbograph_extension PRIVATE
     ${LBUG_LIB}
     ${LBUG_THIRDPARTY_LIBS}
     ${OPENSSL_LIBRARIES}
+    SQLite::SQLite3
     pthread)
 
 if(NOT APPLE)

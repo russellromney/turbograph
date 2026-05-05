@@ -39,6 +39,7 @@ else ()
 endif ()
 
 find_package(OpenSSL REQUIRED)
+find_package(SQLite3 REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
 add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
 
@@ -83,6 +84,8 @@ add_library(turbograph_extension_source
         ${TURBOGRAPH_ROOT}/src/chunk_codec.cpp
         ${TURBOGRAPH_ROOT}/src/manifest.cpp
         ${TURBOGRAPH_ROOT}/src/page_bitmap.cpp
+        ${TURBOGRAPH_ROOT}/src/sqlite_graph_file_system.cpp
+        ${TURBOGRAPH_ROOT}/src/sqlite_page_store.cpp
         ${TURBOGRAPH_ROOT}/src/table_page_map.cpp
         ${TURBOGRAPH_ROOT}/src/tiered_file_system.cpp
         ${TURBOGRAPH_ROOT}/src/crypto.cpp
@@ -102,6 +105,7 @@ if(COMMAND build_extension_lib)
     target_link_libraries(lbug_${EXTENSION_LIB_NAME}_extension
             PRIVATE
             ${OPENSSL_LIBRARIES}
+            SQLite::SQLite3
             ${ZSTD_LIB})
 endif()
 

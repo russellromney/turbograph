@@ -7,10 +7,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(BUILD_TESTS "Build unit and integration tests" ON)
 option(BUILD_EXTENSION_TESTS "Build extension tests (requires LADYBUG_DIR)" OFF)
 option(BUILD_BENCH "Build cypher benchmark (requires LadybugDB)" OFF)
+option(TURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION
+    "Enable sqlite3_load_extension support for loading the turbolite VFS" OFF)
 
 # --- Dependencies ---
 
+if(APPLE AND EXISTS "/opt/homebrew/opt/sqlite")
+    list(PREPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/sqlite")
+endif()
+
 find_package(OpenSSL REQUIRED)
+find_package(SQLite3 REQUIRED)
 find_package(PkgConfig QUIET)
 
 # Find zstd via pkg-config or cmake, fall back to -lzstd.
@@ -81,9 +88,14 @@ add_library(turbograph STATIC
     src/crypto.cpp
     src/manifest.cpp
     src/page_bitmap.cpp
+    src/sqlite_graph_file_system.cpp
+    src/sqlite_page_store.cpp
     src/table_page_map.cpp
-    src/tiered_file_system.cpp
-    src/file_system_stubs.cpp)
+    src/tiered_file_system.cpp)
+
+if(TURBOGRAPH_USE_STUBS)
+    target_sources(turbograph PRIVATE src/file_system_stubs.cpp)
+endif()
 
 if(TURBOGRAPH_USE_STUBS)
     target_include_directories(turbograph PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs)
@@ -97,8 +109,13 @@ endif()
 target_link_libraries(turbograph
     PUBLIC
     ${OPENSSL_LIBRARIES}
+    SQLite::SQLite3
     ${ZSTD_LIBRARIES}
     pthread)
+
+if(TURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION)
+    target_compile_definitions(turbograph PUBLIC TURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION)
+endif()
 
 # --- Tests ---
 

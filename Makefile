@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-s3 test-extension bench clean
+.PHONY: build test test-unit test-s3 test-extension test-turbolite-vfs bench clean
 
 BUILD_DIR ?= build
 CMAKE_FLAGS ?= -DCMAKE_BUILD_TYPE=Debug
@@ -17,7 +17,7 @@ build:
 	cmake --build $(BUILD_DIR) -- -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 test: build
-	cd $(BUILD_DIR) && ctest --output-on-failure -R "ChunkCodec|Manifest|PageBitmap|PageIO|Prefetch[^S]|VFS[^S]|Crypto|Eviction|Drift|Zenith"
+	cd $(BUILD_DIR) && ctest --output-on-failure -R "ChunkCodec|Manifest|PageBitmap|PageIO|SqlitePageStore|SqliteGraphFileSystem|Prefetch[^S]|VFS[^S]|Crypto|Eviction|Drift|Zenith"
 
 test-unit: test
 
@@ -32,6 +32,13 @@ test-extension:
 		-DLADYBUG_DIR=$(LADYBUG_DIR) .
 	cmake --build $(BUILD_DIR) --target test_turbograph_extension -- -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 	cd $(BUILD_DIR) && ctest --output-on-failure -R "TurbographExtension"
+
+test-turbolite-vfs:
+	cmake -B $(BUILD_DIR) $(CMAKE_FLAGS) -DTURBOGRAPH_SQLITE_ENABLE_LOAD_EXTENSION=ON \
+		-DBUILD_EXTENSION_TESTS=ON -DLADYBUG_DIR=$(LADYBUG_DIR) .
+	cmake --build $(BUILD_DIR) --target test_sqlite_page_store test_turbograph_extension -- -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+	cd $(BUILD_DIR) && TURBOGRAPH_TURBOLITE_EXTENSION=$$(cd ../../cinch-target/release 2>/dev/null && pwd)/turbolite.$$(test "$$(uname)" = Darwin && echo dylib || echo so) \
+		TURBOGRAPH_RUN_SQLITE_GRAPH_PERF=1 ctest --output-on-failure -R "SqlitePageStore|TurbographExtension"
 
 # Full benchmark (requires LadybugDB).
 bench:

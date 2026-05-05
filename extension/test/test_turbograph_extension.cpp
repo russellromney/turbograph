@@ -9,20 +9,60 @@
 #include "main/turbograph_extension.h"
 #include "main/turbograph_functions.h"
 
+#include "sqlite_graph_file_system.h"
+
 #include "main/connection.h"
 #include "main/database.h"
+#include "main/db_config.h"
 #include "processor/result/flat_tuple.h"
+#include "storage/buffer_manager/buffer_manager.h"
+#include "storage/storage_utils.h"
 #include "table_page_map.h"
 #include "tiered_file_system.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unistd.h>
 
 using namespace lbug;
+
+namespace lbug::testing {
+
+class BaseGraphTest {
+public:
+    static std::unique_ptr<main::Database> constructDB(std::string_view databasePath,
+        main::SystemConfig systemConfig, main::Database::construct_bm_func_t constructFunc) {
+        return std::unique_ptr<main::Database>(
+            new main::Database(databasePath, systemConfig, std::move(constructFunc)));
+    }
+
+    static const std::string& getDatabasePath(const main::Database& database) {
+        return database.databasePath;
+    }
+
+    static const main::DBConfig& getDBConfig(const main::Database& database) {
+        return dbConfigRef(database.dbConfig);
+    }
+
+private:
+    static const main::DBConfig& dbConfigRef(const main::DBConfig& config) {
+        return config;
+    }
+
+    template<typename ConfigPtr>
+    static const main::DBConfig& dbConfigRef(const ConfigPtr& config) {
+        return *config;
+    }
+};
+
+} // namespace lbug::testing
 
 static std::string queryScalar(main::Connection& conn, const std::string& cypher) {
     auto result = conn.query(cypher);
@@ -34,6 +74,67 @@ static std::string queryScalar(main::Connection& conn, const std::string& cypher
     if (!result->hasNext()) return "";
     auto row = result->getNext();
     return row->getValue(0)->toString();
+}
+
+static void assertQuerySuccess(main::Connection& conn, const std::string& cypher) {
+    auto result = conn.query(cypher);
+    if (!result->isSuccess()) {
+        std::fprintf(stderr, "  QUERY FAILED: %s\n  Error: %s\n",
+            cypher.c_str(), result->getErrorMessage().c_str());
+    }
+    assert(result->isSuccess());
+}
+
+struct SqliteBackedDatabaseOptions {
+    bool autoCheckpoint = false;
+    uint64_t checkpointThreshold = 0;
+    uint32_t sqliteWalAutoCheckpointPages = 100;
+    int32_t sqliteCacheSizePages = 0;
+    std::string sqliteSynchronous = "NORMAL";
+    std::optional<std::string> sqliteVfsName;
+    std::optional<std::string> sqliteLoadableExtensionPath;
+};
+
+static std::unique_ptr<main::Database> openSqliteBackedDatabase(
+    const std::string& dataFilePath, const std::string& sqlitePath,
+    SqliteBackedDatabaseOptions options = {}) {
+    main::SystemConfig sysCfg;
+    sysCfg.autoCheckpoint = options.autoCheckpoint;
+    sysCfg.checkpointThreshold = options.checkpointThreshold;
+    sysCfg.forceCheckpointOnClose = false;
+    // This old Ladybug checkout treats bufferPoolSize=0 as "use default" and
+    // cannot run the storage stack with a one-page pool. Keep the smoke fixed
+    // and modest; newer Kuzu page-cache-disable behavior needs its own run.
+    sysCfg.bufferPoolSize = 1ull << 26;
+    auto constructBM = [sqlitePath, options](const main::Database& db) {
+        const auto& expandedDataFilePath = testing::BaseGraphTest::getDatabasePath(db);
+        const auto& dbConfig = testing::BaseGraphTest::getDBConfig(db);
+        tiered::SqliteGraphFileSystemConfig cfg;
+        cfg.sqlitePath = sqlitePath;
+        cfg.dataFilePath = expandedDataFilePath;
+        cfg.graphPageSize = 4096;
+        cfg.sqlitePageSize = 65536;
+        cfg.sqliteWalAutoCheckpointPages = options.sqliteWalAutoCheckpointPages;
+        cfg.sqliteCacheSizePages = options.sqliteCacheSizePages;
+        cfg.sqliteSynchronous = options.sqliteSynchronous;
+        cfg.sqliteVfsName = options.sqliteVfsName;
+        cfg.sqliteLoadableExtensionPath = options.sqliteLoadableExtensionPath;
+        const_cast<main::Database&>(db).registerFileSystem(
+            std::make_unique<tiered::SqliteGraphFileSystem>(std::move(cfg)));
+        return std::make_unique<storage::BufferManager>(expandedDataFilePath,
+            storage::StorageUtils::getTmpFilePath(expandedDataFilePath),
+            dbConfig.bufferPoolSize, dbConfig.maxDBSize,
+            const_cast<main::Database&>(db).getVFS(), dbConfig.readOnly);
+    };
+    return testing::BaseGraphTest::constructDB(dataFilePath, sysCfg, std::move(constructBM));
+}
+
+static std::optional<std::string> envString(const char* name) {
+    auto value = std::getenv(name);
+    if (value == nullptr || std::string(value).empty()) {
+        return std::nullopt;
+    }
+    return std::string(value);
 }
 
 // --- Test: extension loads without S3 credentials ---
@@ -473,6 +574,241 @@ static void testPerTableScheduleSelection() {
     std::printf("  PASS: testPerTableScheduleSelection\n");
 }
 
+// --- Test: real LadybugDB data file persisted as SQLite graph pages ---
+static void testSqliteBackedDatabasePersistsGraphPages() {
+    auto tmpDir = std::filesystem::temp_directory_path() /
+                  ("turbograph_sqlite_graph_smoke_" + std::to_string(getpid()));
+    std::filesystem::remove_all(tmpDir);
+    std::filesystem::create_directories(tmpDir);
+    auto dataFilePath = (tmpDir / "graph.kz").string();
+    auto sqlitePath = (tmpDir / "graph-pages.sqlite").string();
+
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath);
+        main::Connection conn(db.get());
+
+        assertQuerySuccess(conn,
+            "CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY(name));");
+        assertQuerySuccess(conn, "CREATE (:Person {name: 'Ada', age: 37});");
+        assertQuerySuccess(conn, "CREATE (:Person {name: 'Grace', age: 85});");
+        assert(queryScalar(conn, "MATCH (p:Person) RETURN COUNT(*) AS c;") == "2");
+        assertQuerySuccess(conn, "CHECKPOINT;");
+    }
+
+    assert(std::filesystem::exists(sqlitePath));
+    tiered::SqlitePageStore store(sqlitePath, 4096, std::nullopt, std::nullopt,
+        65536, 100, 0, "NORMAL");
+    assert(store.sqlitePageSize() == 65536);
+    assert(store.walAutoCheckpointPages() == 100);
+    assert(store.sqliteCacheSizePages() == 0);
+    assert(store.fileExists(dataFilePath));
+    assert(store.fileSize(dataFilePath) > 0);
+
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath);
+        main::Connection conn(db.get());
+        assert(queryScalar(conn, "MATCH (p:Person) RETURN COUNT(*) AS c;") == "2");
+        assert(queryScalar(conn,
+                   "MATCH (p:Person) WHERE p.name = 'Ada' RETURN p.age AS age;") == "37");
+    }
+
+    std::filesystem::remove_all(tmpDir);
+
+    std::printf("  PASS: testSqliteBackedDatabasePersistsGraphPages\n");
+}
+
+// --- Test: current Ladybug/Kuzu-style auto_checkpoint=0 physical page smoke ---
+static void testSqliteBackedDatabaseAutoCheckpointZero() {
+    auto tmpDir = std::filesystem::temp_directory_path() /
+                  ("turbograph_sqlite_graph_autockpt_" + std::to_string(getpid()));
+    std::filesystem::remove_all(tmpDir);
+    std::filesystem::create_directories(tmpDir);
+    auto dataFilePath = (tmpDir / "graph.kz").string();
+    auto sqlitePath = (tmpDir / "graph-pages.sqlite").string();
+
+    SqliteBackedDatabaseOptions options;
+    options.autoCheckpoint = true;
+    options.checkpointThreshold = 0;
+    options.sqliteWalAutoCheckpointPages = 100;
+    options.sqliteCacheSizePages = 0;
+    options.sqliteSynchronous = "NORMAL";
+
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath, options);
+        main::Connection conn(db.get());
+
+        assertQuerySuccess(conn,
+            "CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY(name));");
+        assertQuerySuccess(conn, "CREATE (:Person {name: 'Ada', age: 37});");
+        assertQuerySuccess(conn, "CREATE (:Person {name: 'Grace', age: 85});");
+        assert(queryScalar(conn, "MATCH (p:Person) RETURN COUNT(*) AS c;") == "2");
+    }
+
+    tiered::SqlitePageStore store(sqlitePath, 4096, std::nullopt, std::nullopt,
+        65536, 100, 0, "NORMAL");
+    assert(store.fileExists(dataFilePath));
+    assert(store.fileSize(dataFilePath) > 0);
+
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath, options);
+        main::Connection conn(db.get());
+        assert(queryScalar(conn, "MATCH (p:Person) RETURN COUNT(*) AS c;") == "2");
+        assert(queryScalar(conn,
+                   "MATCH (p:Person) WHERE p.name = 'Grace' RETURN p.age AS age;") == "85");
+    }
+
+    std::filesystem::remove_all(tmpDir);
+
+    std::printf("  PASS: testSqliteBackedDatabaseAutoCheckpointZero\n");
+}
+
+// --- Test: same graph smoke through actual SQLite vfs=turbolite ---
+static void testSqliteBackedDatabaseThroughActualTurboliteVfs() {
+    auto extension = envString("TURBOGRAPH_TURBOLITE_EXTENSION");
+    if (!extension) {
+        std::printf("  SKIP: testSqliteBackedDatabaseThroughActualTurboliteVfs "
+                    "(set TURBOGRAPH_TURBOLITE_EXTENSION)\n");
+        return;
+    }
+
+    auto tmpDir = std::filesystem::temp_directory_path() /
+                  ("turbograph_sqlite_graph_turbolite_" + std::to_string(getpid()));
+    std::filesystem::remove_all(tmpDir);
+    std::filesystem::create_directories(tmpDir);
+    auto cacheDir = tmpDir / "turbolite-cache";
+    std::filesystem::create_directories(cacheDir);
+    setenv("TURBOLITE_CACHE_DIR", cacheDir.string().c_str(), 1);
+
+    auto dataFilePath = (tmpDir / "graph.kz").string();
+    auto sqlitePath = (tmpDir / "graph-pages.sqlite").string();
+
+    SqliteBackedDatabaseOptions options;
+    options.autoCheckpoint = true;
+    options.checkpointThreshold = 0;
+    options.sqliteWalAutoCheckpointPages = 100;
+    options.sqliteCacheSizePages = 0;
+    options.sqliteSynchronous = "NORMAL";
+    options.sqliteVfsName = "turbolite";
+    options.sqliteLoadableExtensionPath = *extension;
+
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath, options);
+        main::Connection conn(db.get());
+
+        assertQuerySuccess(conn,
+            "CREATE NODE TABLE Person(name STRING, age INT64, PRIMARY KEY(name));");
+        assertQuerySuccess(conn, "CREATE (:Person {name: 'Ada', age: 37});");
+        assertQuerySuccess(conn, "CREATE (:Person {name: 'Grace', age: 85});");
+        assert(queryScalar(conn, "MATCH (p:Person) RETURN COUNT(*) AS c;") == "2");
+    }
+
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath, options);
+        main::Connection conn(db.get());
+        assert(queryScalar(conn, "MATCH (p:Person) RETURN COUNT(*) AS c;") == "2");
+        assert(queryScalar(conn,
+                   "MATCH (p:Person) WHERE p.name = 'Ada' RETURN p.age AS age;") == "37");
+    }
+
+    std::filesystem::remove_all(tmpDir);
+
+    std::printf("  PASS: testSqliteBackedDatabaseThroughActualTurboliteVfs\n");
+}
+
+static void runSmallWriteAndTraversalPerf(const std::string& label,
+    const std::string& dataFilePath, const std::string& sqlitePath,
+    const SqliteBackedDatabaseOptions& options) {
+    constexpr int nodeCount = 250;
+    long long writeMs = 0;
+    long long traversalMs = 0;
+    {
+        auto db = openSqliteBackedDatabase(dataFilePath, sqlitePath, options);
+        main::Connection conn(db.get());
+
+        assertQuerySuccess(conn,
+            "CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id));");
+        assertQuerySuccess(conn, "CREATE REL TABLE Knows(FROM Person TO Person);");
+
+        auto writesStart = std::chrono::steady_clock::now();
+        for (int i = 0; i < nodeCount; i++) {
+            assertQuerySuccess(conn, "CREATE (:Person {id: " + std::to_string(i) +
+                                     ", name: 'p" + std::to_string(i) + "'});");
+        }
+        for (int i = 0; i < nodeCount - 1; i++) {
+            assertQuerySuccess(conn,
+                "MATCH (a:Person {id: " + std::to_string(i) +
+                "}), (b:Person {id: " + std::to_string(i + 1) +
+                "}) CREATE (a)-[:Knows]->(b);");
+        }
+        auto writesEnd = std::chrono::steady_clock::now();
+
+        auto traversalStart = std::chrono::steady_clock::now();
+        auto relCount = queryScalar(conn,
+            "MATCH (a:Person)-[:Knows]->(b:Person) RETURN COUNT(*) AS c;");
+        auto lookupCount = queryScalar(conn,
+            "MATCH (a:Person {id: 1})-[:Knows]->(b:Person) RETURN COUNT(*) AS c;");
+        auto traversalEnd = std::chrono::steady_clock::now();
+
+        assert(relCount == std::to_string(nodeCount - 1));
+        assert(lookupCount == "1");
+
+        writeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            writesEnd - writesStart).count();
+        traversalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            traversalEnd - traversalStart).count();
+    }
+
+    tiered::SqlitePageStore store(sqlitePath, 4096, options.sqliteVfsName,
+        options.sqliteLoadableExtensionPath, 65536, options.sqliteWalAutoCheckpointPages,
+        options.sqliteCacheSizePages, options.sqliteSynchronous);
+    std::printf("    PERF[%s]: %d node writes + %d rel writes in %lld ms; "
+                "2 traversals in %lld ms; graph bytes=%llu\n",
+        label.c_str(), nodeCount, nodeCount - 1, writeMs, traversalMs,
+        static_cast<unsigned long long>(store.fileSize(dataFilePath)));
+}
+
+// --- Perf probe: many tiny writes + graph traversal, opt-in so CI remains quiet ---
+static void testSqliteBackedSmallWriteAndTraversalPerf() {
+    if (!envString("TURBOGRAPH_RUN_SQLITE_GRAPH_PERF")) {
+        std::printf("  SKIP: testSqliteBackedSmallWriteAndTraversalPerf "
+                    "(set TURBOGRAPH_RUN_SQLITE_GRAPH_PERF)\n");
+        return;
+    }
+
+    auto tmpDir = std::filesystem::temp_directory_path() /
+                  ("turbograph_sqlite_graph_perf_" + std::to_string(getpid()));
+    std::filesystem::remove_all(tmpDir);
+    std::filesystem::create_directories(tmpDir);
+
+    SqliteBackedDatabaseOptions options;
+    options.autoCheckpoint = true;
+    options.checkpointThreshold = 0;
+    options.sqliteWalAutoCheckpointPages = 100;
+    options.sqliteCacheSizePages = 0;
+    options.sqliteSynchronous = "NORMAL";
+
+    runSmallWriteAndTraversalPerf("sqlite",
+        (tmpDir / "graph-sqlite.kz").string(),
+        (tmpDir / "graph-pages-sqlite.sqlite").string(), options);
+
+    auto extension = envString("TURBOGRAPH_TURBOLITE_EXTENSION");
+    if (extension) {
+        auto cacheDir = tmpDir / "turbolite-cache";
+        std::filesystem::create_directories(cacheDir);
+        setenv("TURBOLITE_CACHE_DIR", cacheDir.string().c_str(), 1);
+        auto turboliteOptions = options;
+        turboliteOptions.sqliteVfsName = "turbolite";
+        turboliteOptions.sqliteLoadableExtensionPath = *extension;
+        runSmallWriteAndTraversalPerf("turbolite",
+            (tmpDir / "graph-turbolite.kz").string(),
+            (tmpDir / "graph-pages-turbolite.sqlite").string(), turboliteOptions);
+    }
+
+    std::filesystem::remove_all(tmpDir);
+
+    std::printf("  PASS: testSqliteBackedSmallWriteAndTraversalPerf\n");
+}
+
 int main() {
     std::printf("=== Turbograph Extension Tests ===\n");
 
@@ -489,7 +825,11 @@ int main() {
     testExtractTablesFromPlan();
     testBuildTablePageMap();
     testPerTableScheduleSelection();
+    testSqliteBackedDatabasePersistsGraphPages();
+    testSqliteBackedDatabaseAutoCheckpointZero();
+    testSqliteBackedDatabaseThroughActualTurboliteVfs();
+    testSqliteBackedSmallWriteAndTraversalPerf();
 
-    std::printf("  All 13 extension tests passed.\n");
+    std::printf("  All extension tests passed.\n");
     return 0;
 }
