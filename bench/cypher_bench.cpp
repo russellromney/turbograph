@@ -30,6 +30,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sqlite3.h>
@@ -119,6 +120,26 @@ static int envInt(const char* name, int defaultValue) {
         return defaultValue;
     }
     return std::atoi(value);
+}
+
+static bool envBool(const char* name, bool defaultValue) {
+    auto value = std::getenv(name);
+    if (value == nullptr || std::string(value).empty()) {
+        return defaultValue;
+    }
+    auto s = std::string(value);
+    std::transform(s.begin(), s.end(), s.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !(s == "0" || s == "false" || s == "no" || s == "off");
+}
+
+static void sleepFromEnvMs(const char* name) {
+    auto ms = envInt(name, 0);
+    if (ms <= 0) {
+        return;
+    }
+    std::printf("  Sleeping for %dms (%s)...\n", ms, name);
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
 // --- Data Generation ---
@@ -659,6 +680,7 @@ static void runWriteCheckpointCycles(lbug::main::Connection& conn, uint32_t star
     std::printf("  Repeated write proof: %d writes, checkpoint every %d...\n",
         cycles, checkpointEvery);
     auto start = Clock::now();
+    auto writeDelayMs = envInt("BENCH_WRITE_DELAY_MS", 0);
     for (int i = 0; i < cycles; i++) {
         auto id = static_cast<uint64_t>(startId) + static_cast<uint64_t>(i);
         auto q = std::string("CREATE (:Person {id: ") + std::to_string(id) +
@@ -666,6 +688,9 @@ static void runWriteCheckpointCycles(lbug::main::Connection& conn, uint32_t star
                  "', gender: 'probe', age: " + std::to_string(20 + (i % 50)) +
                  ", isMarried: false})";
         exec(conn, q.c_str());
+        if (writeDelayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(writeDelayMs));
+        }
         if ((i + 1) % checkpointEvery == 0) {
             exec(conn, "CHECKPOINT");
         }
@@ -733,7 +758,8 @@ int main(int argc, char** argv) {
         std::filesystem::exists("/data") ? "/data" : "/tmp");
     std::filesystem::create_directories(base);
     StoragePaths paths;
-    paths.dbPath = base + "/cypher_bench_" + tag + modeSuffix + ".kz";
+    paths.dbPath = envString("BENCH_DB_PATH").value_or(
+        base + "/cypher_bench_" + tag + modeSuffix + ".kz");
     paths.dataDir = base + "/cypher_bench_data_" + tag + modeSuffix;
     paths.cacheDir = base + "/cypher_bench_cache_" + tag + modeSuffix;
     paths.sqlitePath = base + "/cypher_bench_pages_" + tag + modeSuffix + ".sqlite";
@@ -743,6 +769,9 @@ int main(int argc, char** argv) {
     if (usesSqlitePageStore(storageMode)) {
         dbExists = std::filesystem::exists(paths.sqlitePath);
     }
+    if (envBool("BENCH_FORCE_REUSE_DB", false)) {
+        dbExists = true;
+    }
     std::printf("  Mode: %s\n", modeName(storageMode));
     std::printf("  DB path: %s (%s)\n", paths.dbPath.c_str(), dbExists ? "exists" : "new");
     if (usesSqlitePageStore(storageMode)) {
@@ -751,7 +780,8 @@ int main(int argc, char** argv) {
 
     lbug::tiered::TieredConfig tieredCfg;
     if (usesTigris(storageMode)) {
-        tieredCfg.s3 = {ep, "cinch-data", "bench/cypher/v2/" + tag, "auto", ak, sk};
+        auto bucket = envString("TIGRIS_STORAGE_BUCKET").value_or("cinch-data");
+        tieredCfg.s3 = {ep, bucket, "bench/cypher/v2/" + tag, "auto", ak, sk};
         tieredCfg.dataFilePath = paths.dbPath;
         tieredCfg.cacheDir = paths.cacheDir;
         tieredCfg.pageSize = 4096;
@@ -899,6 +929,7 @@ int main(int argc, char** argv) {
         loadMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - loadStart).count();
         std::printf("  Data loaded in %lldms\n", (long long)loadMs);
+        sleepFromEnvMs("BENCH_SLEEP_AFTER_LOAD_MS");
 
         std::printf("  Checkpointing%s...\n",
             usesTigris(storageMode) ? " (flushing to Tigris)" : "");
@@ -907,6 +938,7 @@ int main(int argc, char** argv) {
         ckptMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - ckptStart).count();
         std::printf("  Checkpoint: %lldms\n", (long long)ckptMs);
+        sleepFromEnvMs("BENCH_SLEEP_AFTER_CHECKPOINT_MS");
 
         if (turboliteMetrics) {
             std::printf("  Flushing turbolite staging to object storage...\n");
@@ -916,6 +948,7 @@ int main(int argc, char** argv) {
                 (long long)flushMs,
                 (unsigned long long)c.gets, (unsigned long long)(c.getBytes / 1024),
                 (unsigned long long)c.puts, (unsigned long long)(c.putBytes / 1024));
+            sleepFromEnvMs("BENCH_SLEEP_AFTER_FLUSH_MS");
         }
 
         // Measure total data size: dbPath (metadata) + cacheDir (tiered pages).
@@ -955,6 +988,7 @@ int main(int argc, char** argv) {
                 (unsigned long long)c.gets, (unsigned long long)(c.getBytes / 1024),
                 (unsigned long long)c.puts, (unsigned long long)(c.putBytes / 1024));
         }
+        sleepFromEnvMs("BENCH_SLEEP_AFTER_FINAL_FLUSH_MS");
     }
 
     auto writeCycles = envInt("BENCH_WRITE_CYCLES", 0);
@@ -1030,6 +1064,7 @@ int main(int argc, char** argv) {
             if (!result->isSuccess()) {
                 std::fprintf(stderr, "  FAIL [%s] %s: %s\n",
                     label, QUERIES[q].name, result->getErrorMessage().c_str());
+                std::exit(1);
             }
             uint64_t s3Reqs = s3Ptr ? s3Ptr->fetchCount.load() : 0;
             uint64_t s3Bytes = s3Ptr ? s3Ptr->fetchBytes.load() : 0;
@@ -1091,6 +1126,7 @@ int main(int argc, char** argv) {
                 if (!result->isSuccess()) {
                     std::fprintf(stderr, "  FAIL [cold] %s: %s\n",
                         QUERIES[q].name, result->getErrorMessage().c_str());
+                    std::exit(1);
                 }
                 uint64_t s3Reqs = coldS3 ? coldS3->fetchCount.load() : 0;
                 uint64_t s3Bytes = coldS3 ? coldS3->fetchBytes.load() : 0;
@@ -1135,6 +1171,7 @@ int main(int argc, char** argv) {
                 if (!r->isSuccess()) {
                     std::fprintf(stderr, "  FAIL [warmup] %s: %s\n",
                         QUERIES[q].name, r->getErrorMessage().c_str());
+                    std::exit(1);
                 }
             }
         }

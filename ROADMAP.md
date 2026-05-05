@@ -175,6 +175,19 @@ machinery.
     in a new process. All 9 queries passed fetched from Tigris; local disk size
     before query execution was 0MB. Cold timings: Q1 982ms, Q2 1.0s,
     Q3 376ms, Q4 409ms, Q5 684ms, Q6 577ms, Q7 434ms, Q8 283ms, Q9 642ms.
+- [x] Prove a stronger fresh clone with a different local SQLite/cache path
+  - Added `BENCH_DB_PATH` to pin the logical graph DB identity separately from
+    the local scratch directory, and `BENCH_FORCE_REUSE_DB=1` to open remote
+    state without local artifacts.
+  - A 100k publish from one local directory, followed by a reopen from a
+    different local SQLite path and empty turbolite cache, passed all 9
+    queries against the same Tigris prefix. The clone-side local disk size was
+    0MB before query execution. Cold timings: Q1 848ms, Q2 1.1s, Q3 580ms,
+    Q4 414ms, Q5 685ms, Q6 474ms, Q7 423ms, Q8 335ms, Q9 585ms.
+  - Current identity contract: remote clone needs the same turbolite prefix,
+    the same SQLite DB identity/name, the same logical graph DB path stored in
+    `graph_files`, and a writable parent directory for Ladybug/Kuzu sidecars
+    such as `*.wal`.
 - [x] Run a wider 100k grouping/prefetch matrix on real Tigris
   - `ppg32/spf4`: more PUTs and slightly lower bytes than `64/4`, but GET
     count remained similar and latency did not improve materially. Cold:
@@ -192,8 +205,31 @@ machinery.
     and remote prefix in a second process completed all 9 queries. This is not
     a full crash-safety matrix, but it proves a killed reader after publish did
     not poison the image.
+- [ ] Complete the crash matrix
+  - Added targeted harness knobs (`BENCH_SLEEP_AFTER_LOAD_MS`,
+    `BENCH_SLEEP_AFTER_CHECKPOINT_MS`, `BENCH_SLEEP_AFTER_FLUSH_MS`,
+    `BENCH_SLEEP_AFTER_FINAL_FLUSH_MS`, and `BENCH_WRITE_DELAY_MS`) so timeout
+    kills can land at known phase boundaries.
+  - Current result: killing during initial load leaves local Kuzu sidecar state
+    (`*.wal.checkpoint`) that must be cleaned before reuse. Force-opening an
+    unpublished or identity-mismatched remote prefix yields an empty catalog,
+    as expected. Killing after explicit turbolite flush but before a fully
+    graceful Kuzu/catalog lifecycle still did not produce a remotely readable
+    clone in the small 10k harness; this needs a tighter publish barrier than
+    "SQLite pages flushed".
+  - The benchmark now exits non-zero on query failures so future crash probes
+    cannot silently pass with `Table Person does not exist`.
 - [ ] Compare against current turbograph on cold read, hot read, checkpoint
   write amplification, and object GET count
+  - Attempted a native `TieredFileSystem` 100k baseline with the same soup
+    Tigris credentials. The old path first rejected an `https://` endpoint;
+    after stripping the scheme it aborted during manifest cleanup with
+    `recursive_mutex lock failed: Invalid argument`. Baseline comparison is
+    blocked on repairing the native S3 benchmark path.
+- [ ] Run beyond 100k scale
+  - 250k and 1M `turbolite-s3` runs both segfaulted during `COPY`/load before
+    storage/query measurements. The 1M run generated 10M follow edges
+    successfully, then crashed during load. This is the next scale blocker.
 
 ### e. Kill criteria
 - [x] Measure whether double paging makes cold traversal obviously worse
