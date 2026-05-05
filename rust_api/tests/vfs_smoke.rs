@@ -3,10 +3,11 @@ mod vfs_smoke {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn udf_calls_fail_clearly_without_extension() {
-        // The Rust handle is intentionally thin: if the turbograph extension is
-        // not loaded into Ladybug, every UDF-backed operation must fail clearly
-        // instead of silently pretending the VFS has an empty manifest.
+    async fn extension_loaded_without_active_tfs_reports_empty_or_error() {
+        // The extension test command statically links turbograph into Ladybug,
+        // but this database is not opened through a configured Turbograph VFS.
+        // Read-only probes should report "no active manifest"; mutating ops
+        // should fail clearly instead of pretending an apply/sync succeeded.
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Arc::new(
             lbug::Database::new(
@@ -18,30 +19,18 @@ mod vfs_smoke {
         let vfs = turbograph::TurbographVfs::new(db);
 
         let result = vfs.sync().await;
-        assert!(
-            result.is_err(),
-            "sync should fail without turbograph extension: {:?}",
-            result
-        );
+        assert!(result.is_err(), "sync should fail without active TFS: {:?}", result);
 
         let result = vfs.manifest_bytes().await;
-        assert!(
-            result.is_err(),
-            "manifest_bytes should fail without turbograph extension: {:?}",
-            result
-        );
+        assert_eq!(result.unwrap(), None);
 
         let result = vfs.manifest_version().await;
-        assert!(
-            result.is_err(),
-            "manifest_version should fail without turbograph extension: {:?}",
-            result
-        );
+        assert_eq!(result.unwrap(), None);
 
         let result = vfs.set_manifest_bytes(&[0x01, 0x02, 0x03]).await;
         assert!(
             result.is_err(),
-            "set_manifest_bytes should fail without turbograph extension: {:?}",
+            "set_manifest_bytes should fail without active TFS: {:?}",
             result
         );
     }

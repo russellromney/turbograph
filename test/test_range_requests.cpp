@@ -29,13 +29,18 @@ static S3Config getConfig() {
     }
     auto endpoint = std::getenv("TIGRIS_STORAGE_ENDPOINT");
     auto bucket = std::getenv("TIGRIS_BUCKET");
+    if (!bucket) bucket = std::getenv("S3_TEST_BUCKET");
+    if (!bucket) bucket = std::getenv("TIERED_TEST_BUCKET");
+    auto region = std::getenv("TIGRIS_STORAGE_REGION");
+    if (!region) region = std::getenv("AWS_REGION");
+    if (!region) region = std::getenv("AWS_DEFAULT_REGION");
 
     return S3Config{
         .endpoint = endpoint ? endpoint : "https://t3.storage.dev",
         .bucket = bucket ? bucket : "cinch-data",
         .prefix = "test-range-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()),
-        .region = "auto",
+        .region = region ? region : "auto",
         .accessKey = accessKey,
         .secretKey = secretKey,
         .poolSize = 8,

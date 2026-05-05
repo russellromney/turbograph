@@ -88,6 +88,7 @@ add_library(turbograph_extension_source
         ${TURBOGRAPH_ROOT}/src/crypto.cpp
         # Extension glue (registration + UDFs + parsers).
         ${TURBOGRAPH_ROOT}/extension/src/main/turbograph_extension.cpp
+        ${TURBOGRAPH_ROOT}/extension/src/main/turbograph_substrate.cpp
         ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_config.cpp
         ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_manifest.cpp
         ${TURBOGRAPH_ROOT}/extension/src/functions/table_map_builder.cpp

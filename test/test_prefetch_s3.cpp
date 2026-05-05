@@ -27,12 +27,18 @@ static S3Config configFromEnv() {
     auto accessKey = std::getenv("TIGRIS_STORAGE_ACCESS_KEY_ID");
     auto secretKey = std::getenv("TIGRIS_STORAGE_SECRET_ACCESS_KEY");
     auto endpoint = std::getenv("TIGRIS_STORAGE_ENDPOINT");
+    auto bucket = std::getenv("TIGRIS_BUCKET");
+    if (!bucket) bucket = std::getenv("S3_TEST_BUCKET");
+    if (!bucket) bucket = std::getenv("TIERED_TEST_BUCKET");
+    auto region = std::getenv("TIGRIS_STORAGE_REGION");
+    if (!region) region = std::getenv("AWS_REGION");
+    if (!region) region = std::getenv("AWS_DEFAULT_REGION");
     if (!accessKey || !secretKey || !endpoint) {
         std::printf("SKIP: Tigris credentials not set\n");
         std::exit(0);
     }
-    return S3Config{endpoint, "cinch-data", "test/tiered-prefetch-integration",
-        "auto", accessKey, secretKey};
+    return S3Config{endpoint, bucket ? bucket : "cinch-data", "test/tiered-prefetch-integration",
+                    region ? region : "auto", accessKey, secretKey};
 }
 
 static std::filesystem::path tmpDir() {

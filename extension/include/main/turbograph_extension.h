@@ -27,6 +27,7 @@ public:
     static std::unique_ptr<function::FunctionBindData> bindFunction(
         const function::ScalarBindFuncInput& input);
     static void registerTfs(main::Database* db, tiered::TieredFileSystem* tfs);
+    static tiered::TieredFileSystem* tfsForDatabase(main::Database* db);
 
     // Fallback pointer maintained by registerTfs() for legacy single-DB callers.
     // UDFs should prefer tfsFromBindData() so multiple embedded databases in

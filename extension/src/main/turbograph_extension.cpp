@@ -172,6 +172,10 @@ void TurbographExtension::registerTfs(main::Database* database, tiered::TieredFi
     tfs = activeTfs;
 }
 
+tiered::TieredFileSystem* TurbographExtension::tfsForDatabase(main::Database* database) {
+    return registeredTfs(database);
+}
+
 static tiered::TieredConfig configFromExtensionOptions(main::ClientContext* context) {
     tiered::TieredConfig cfg;
 

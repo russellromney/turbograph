@@ -8,6 +8,7 @@
 
 #include "main/turbograph_extension.h"
 #include "main/turbograph_functions.h"
+#include "main/turbograph_substrate.h"
 
 #include "main/connection.h"
 #include "main/database.h"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <unistd.h>
 
@@ -129,6 +131,72 @@ static void testPerDbRegistryDoesNotFallbackAcrossDatabases() {
     turbograph_extension::TurbographExtension::registerTfs(&db1, nullptr);
 
     std::printf("  PASS: testPerDbRegistryDoesNotFallbackAcrossDatabases\n");
+}
+
+// --- Test: direct substrate does not need turbograph_* UDF registration ---
+static void testDirectSubstrateWorksWithoutUdfs() {
+    main::SystemConfig sysCfg;
+    main::Database db(":memory:", sysCfg);
+    main::Connection conn(&db);
+
+    auto missingUdf = queryScalar(conn, "RETURN turbograph_sync() AS v");
+    assert(missingUdf.rfind("ERROR:", 0) == 0);
+
+    auto tmpDir = std::filesystem::temp_directory_path() /
+        ("turbograph_direct_substrate_" + std::to_string(getpid()));
+    std::filesystem::remove_all(tmpDir);
+    std::filesystem::create_directories(tmpDir);
+
+    {
+        tiered::TieredConfig cfg;
+        cfg.s3 = {"http://dummy", "bucket", "prefix", "auto", "ak", "sk"};
+        cfg.dataFilePath = (tmpDir / "data.kz").string();
+        cfg.cacheDir = (tmpDir / "cache").string();
+        cfg.pagesPerGroup = 4;
+        auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
+        turbograph_extension::TurbographSubstrate substrate(&db, tfsPtr.get());
+        assert(substrate.manifestVersion() == 0);
+        assert(substrate.syncBaseForTestWithoutCheckpoint() == 0);
+        try {
+            (void)substrate.manifestBytes();
+            assert(false && "manifestBytes should require an active file");
+        } catch (const std::exception& e) {
+            assert(std::string(e.what()).find("no active file") != std::string::npos);
+        }
+    }
+
+    std::filesystem::remove_all(tmpDir);
+
+    std::printf("  PASS: testDirectSubstrateWorksWithoutUdfs\n");
+}
+
+// --- Test: direct substrate checkpoints graph mutations before base sync ---
+static void testDirectSubstrateCheckpointsBeforeSync() {
+    main::SystemConfig sysCfg;
+    main::Database db(":memory:", sysCfg);
+    main::Connection conn(&db);
+
+    auto missingUdf = queryScalar(conn, "RETURN turbograph_sync() AS v");
+    assert(missingUdf.rfind("ERROR:", 0) == 0);
+
+    auto created = conn.query(
+        "CREATE NODE TABLE DirectProof(id INT64, name STRING, PRIMARY KEY(id))");
+    assert(created->isSuccess());
+    auto inserted = conn.query("CREATE (:DirectProof {id: 1, name: 'checkpoint'})");
+    assert(inserted->isSuccess());
+
+    tiered::TieredConfig cfg;
+    cfg.s3 = {"http://dummy", "bucket", "prefix", "auto", "ak", "sk"};
+    cfg.dataFilePath = "/tmp/nonexistent.kz";
+    cfg.cacheDir = "/tmp/turbograph_direct_substrate_checkpoint_cache";
+    auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
+
+    turbograph_extension::TurbographSubstrate substrate(&db, tfsPtr.get());
+    assert(substrate.syncCheckpointedBase() == 0);
+
+    std::filesystem::remove_all(cfg.cacheDir);
+
+    std::printf("  PASS: testDirectSubstrateCheckpointsBeforeSync\n");
 }
 
 // --- Test: config_set with invalid key returns error ---
@@ -480,6 +548,8 @@ int main() {
     testUDFsRegistered();
     testTfsRegistryDropsExpiredEntry();
     testPerDbRegistryDoesNotFallbackAcrossDatabases();
+    testDirectSubstrateWorksWithoutUdfs();
+    testDirectSubstrateCheckpointsBeforeSync();
     testConfigSetUnknownKey();
     testConfigSetGetRoundTrip();
     testConfigSetBadFloat();
@@ -490,6 +560,6 @@ int main() {
     testBuildTablePageMap();
     testPerTableScheduleSelection();
 
-    std::printf("  All 13 extension tests passed.\n");
+    std::printf("  All 15 extension tests passed.\n");
     return 0;
 }

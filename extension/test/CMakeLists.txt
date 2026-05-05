@@ -50,6 +50,7 @@ endif()
 add_executable(test_turbograph_extension
     test_turbograph_extension.cpp
     ${TURBOGRAPH_ROOT}/extension/src/main/turbograph_extension.cpp
+    ${TURBOGRAPH_ROOT}/extension/src/main/turbograph_substrate.cpp
     ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_config.cpp
     ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_manifest.cpp
     ${TURBOGRAPH_ROOT}/extension/src/functions/table_map_builder.cpp

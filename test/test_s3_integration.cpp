@@ -28,6 +28,11 @@ static S3Config getTestConfig() {
     }
     auto endpoint = std::getenv("TIGRIS_STORAGE_ENDPOINT");
     auto bucket = std::getenv("TIGRIS_BUCKET");
+    if (!bucket) bucket = std::getenv("S3_TEST_BUCKET");
+    if (!bucket) bucket = std::getenv("TIERED_TEST_BUCKET");
+    auto region = std::getenv("TIGRIS_STORAGE_REGION");
+    if (!region) region = std::getenv("AWS_REGION");
+    if (!region) region = std::getenv("AWS_DEFAULT_REGION");
 
     S3Config config;
     config.accessKey = accessKey;
@@ -35,7 +40,7 @@ static S3Config getTestConfig() {
     config.endpoint = endpoint ? endpoint : "https://t3.storage.dev";
     config.bucket = bucket ? bucket : "cinch-data";
     config.prefix = "test/tiered-vfs-integration";
-    config.region = "auto";
+    config.region = region ? region : "auto";
     return config;
 }
 
