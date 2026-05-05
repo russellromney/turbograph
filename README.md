@@ -55,8 +55,8 @@ export TIGRIS_STORAGE_SECRET_ACCESS_KEY=...
 export TIGRIS_STORAGE_ENDPOINT=https://fly.storage.tigris.dev
 make test-s3
 
-# Build benchmark (needs LadybugDB source tree)
-make bench LADYBUG_DIR=/path/to/ladybug
+# Build benchmark (needs a recent LadybugDB source tree)
+make bench LADYBUG_DIR=../ladybug-current
 
 # Deploy benchmark to Fly.io
 make deploy-bench
@@ -115,7 +115,7 @@ The `extension/` directory contains the LadybugDB extension that bridges turbogr
 - **UDFs** (`turbograph_config.cpp`): `turbograph_config_set` / `turbograph_config_get` for runtime schedule switching, table map rebuild, S3 counters
 - **Extension loader** (`turbograph_extension.cpp`): registers the VFS, metadata parser callback, and UDFs
 
-The extension compiles against LadybugDB headers (requires `LADYBUG_DIR`). The core turbograph library has no LadybugDB dependency beyond the `FileSystem` interface stubs.
+The extension compiles against LadybugDB headers (requires `LADYBUG_DIR`; local development defaults to `../ladybug-current`). The core turbograph library has no LadybugDB dependency beyond the `FileSystem` interface stubs.
 
 ## Dependencies
 

@@ -3,10 +3,10 @@
 
 #include "main/turbograph_functions.h"
 
-#include "common/types/ku_string.h"
 #include "common/vector/value_vector.h"
 #include "function/scalar_function.h"
 #include "main/turbograph_extension.h"
+#include "main/turbograph_lbug_compat.h"
 #include "tiered_file_system.h"
 
 namespace lbug {
@@ -134,7 +134,7 @@ static void setManifestExec(const std::vector<std::shared_ptr<ValueVector>>& par
             continue;
         }
 
-        auto jsonStr = parameters[0]->getValue<ku_string_t>(jsonPos).getAsString();
+        auto jsonStr = parameters[0]->getValue<turbograph_string_t>(jsonPos).getAsString();
         try {
             auto version = tfs->applyRemoteManifest(jsonStr);
             result.setNull(resultPos, false);
@@ -210,7 +210,7 @@ static void manifestBytesHybridExec(const std::vector<std::shared_ptr<ValueVecto
         }
 
         auto journalSeq = static_cast<uint64_t>(parameters[0]->getValue<int64_t>(seqPos));
-        auto prefixStr = parameters[1]->getValue<ku_string_t>(prefixPos).getAsString();
+        auto prefixStr = parameters[1]->getValue<turbograph_string_t>(prefixPos).getAsString();
 
         try {
             auto bytes = tfs->manifestBytesWithGraphstreamDelta(journalSeq, prefixStr);
@@ -251,7 +251,7 @@ static void setManifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>
             continue;
         }
 
-        auto blob = parameters[0]->getValue<ku_string_t>(bytesPos);
+        auto blob = parameters[0]->getValue<turbograph_string_t>(bytesPos);
         std::vector<uint8_t> bytes(blob.len);
         std::memcpy(bytes.data(), blob.getData(), blob.len);
 

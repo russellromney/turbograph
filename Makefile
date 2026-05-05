@@ -25,8 +25,9 @@ test-unit: test
 test-s3: build
 	cd $(BUILD_DIR) && ctest --output-on-failure -R "S3|PrefetchS3|VFSS3|RangeRequest"
 
-# Extension tests (requires LADYBUG_DIR).
-LADYBUG_DIR ?= $(shell cd .. && pwd)/ladybug
+# Extension tests (requires LADYBUG_DIR). Prefer the current Ladybug checkout
+# used by graph substrate work, but keep LADYBUG_DIR overridable for CI/users.
+LADYBUG_DIR ?= $(shell cd .. && pwd)/ladybug-current
 test-extension:
 	cmake -B $(BUILD_DIR) $(CMAKE_FLAGS) -DBUILD_EXTENSION_TESTS=ON \
 		-DLADYBUG_DIR=$(LADYBUG_DIR) .

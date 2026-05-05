@@ -1,10 +1,10 @@
 #include "main/turbograph_functions.h"
 
-#include "common/types/ku_string.h"
 #include "common/vector/value_vector.h"
 #include "function/scalar_function.h"
 #include "main/database.h"
 #include "main/turbograph_extension.h"
+#include "main/turbograph_lbug_compat.h"
 #include "table_page_map.h"
 #include "tiered_file_system.h"
 
@@ -33,8 +33,8 @@ static void configSetExec(const std::vector<std::shared_ptr<ValueVector>>& param
         result.setNull(resultPos, isNull);
         if (isNull || !tfs) continue;
 
-        auto key = parameters[0]->getValue<ku_string_t>(keyPos).getAsString();
-        auto val = parameters[1]->getValue<ku_string_t>(valPos).getAsString();
+        auto key = parameters[0]->getValue<turbograph_string_t>(keyPos).getAsString();
+        auto val = parameters[1]->getValue<turbograph_string_t>(valPos).getAsString();
 
         if (key == "prefetch") {
             // Set active schedule by name: "scan", "lookup", "default".
@@ -129,7 +129,7 @@ static void configGetExec(const std::vector<std::shared_ptr<ValueVector>>& param
             continue;
         }
 
-        auto key = parameters[0]->getValue<ku_string_t>(keyPos).getAsString();
+        auto key = parameters[0]->getValue<turbograph_string_t>(keyPos).getAsString();
 
         if (key == "prefetch") {
             StringVector::addString(&result, resultPos, tfs->getActiveSchedule());

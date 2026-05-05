@@ -17,7 +17,7 @@ Requires LadybugDB source tree built as a static library.
 
 ```bash
 # Build LadybugDB
-cd ../ladybug-fork
+cd ../ladybug-current
 cmake -B build/release -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DBUILD_SHELL=FALSE -DBUILD_SINGLE_FILE_HEADER=FALSE .
@@ -25,7 +25,7 @@ cmake --build build/release --target lbug -- -j$(nproc)
 
 # Build turbograph benchmark
 cd ../turbograph
-make bench LADYBUG_DIR=../ladybug-fork
+make bench LADYBUG_DIR=../ladybug-current
 
 # Run (requires Tigris credentials)
 export TIGRIS_STORAGE_ACCESS_KEY_ID=...

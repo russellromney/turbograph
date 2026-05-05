@@ -42,6 +42,15 @@ if(NOT EXISTS "${LBUG_LIB}")
         HINTS "${LBUG_BUILD_DIR}/src" "${LBUG_BUILD_DIR}/lib"
         NO_DEFAULT_PATH)
 endif()
+
+set(TURBOGRAPH_LBUG_ZSTD_HEADER "${LADYBUG_DIR}/third_party/zstd/include/zstd.h")
+set(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE FALSE)
+if(EXISTS "${TURBOGRAPH_LBUG_ZSTD_HEADER}")
+    file(READ "${TURBOGRAPH_LBUG_ZSTD_HEADER}" TURBOGRAPH_LBUG_ZSTD_HEADER_TEXT)
+    if(TURBOGRAPH_LBUG_ZSTD_HEADER_TEXT MATCHES "namespace[ \t\r\n]+lbug_zstd")
+        set(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE TRUE)
+    endif()
+endif()
 if(NOT LBUG_LIB)
     message(FATAL_ERROR "Cannot find liblbug. Build LadybugDB first: cd ${LADYBUG_DIR} && make release")
 endif()
@@ -74,7 +83,10 @@ add_executable(test_turbograph_static_checkpoint
 
 foreach(target test_turbograph_extension test_turbograph_static_checkpoint)
     target_compile_definitions(${target} PRIVATE
-        CPPHTTPLIB_OPENSSL_SUPPORT LBUG_ZSTD_NAMESPACE)
+        CPPHTTPLIB_OPENSSL_SUPPORT)
+    if(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE)
+        target_compile_definitions(${target} PRIVATE LBUG_ZSTD_NAMESPACE)
+    endif()
 
     # LadybugDB headers BEFORE turbograph includes so real headers win over stubs.
     # Do NOT include stubs/ here.

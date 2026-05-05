@@ -49,6 +49,15 @@ find_library(ZSTD_LIB NAMES zstd
 find_path(ZSTD_INCLUDE NAMES zstd.h
     HINTS /opt/homebrew/opt/zstd/include /usr/local/include /usr/include)
 
+set(TURBOGRAPH_LBUG_ZSTD_HEADER "${LBUG_SRC_DIR}/third_party/zstd/include/zstd.h")
+set(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE FALSE)
+if(EXISTS "${TURBOGRAPH_LBUG_ZSTD_HEADER}")
+    file(READ "${TURBOGRAPH_LBUG_ZSTD_HEADER}" TURBOGRAPH_LBUG_ZSTD_HEADER_TEXT)
+    if(TURBOGRAPH_LBUG_ZSTD_HEADER_TEXT MATCHES "namespace[ \t\r\n]+lbug_zstd")
+        set(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE TRUE)
+    endif()
+endif()
+
 # Fetch httplib.
 include(FetchContent)
 FetchContent_Declare(httplib
@@ -73,8 +82,9 @@ include_directories(
 # ALP third-party headers (needed by compression.h).
 include_directories(${LBUG_SRC_DIR}/third_party/alp/include)
 
-# Tell turbograph source files to use lbug_zstd:: namespace.
-add_compile_definitions(LBUG_ZSTD_NAMESPACE)
+if(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE)
+    add_compile_definitions(LBUG_ZSTD_NAMESPACE)
+endif()
 
 add_library(turbograph_extension_source
         OBJECT
