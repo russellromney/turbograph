@@ -8,13 +8,13 @@
 #include <string>
 
 namespace httplib {
-class Client;
+class ClientImpl;
 }
 
 namespace lbug {
 namespace tiered {
 
-// Thread-safe pool of persistent httplib::Client instances.
+// Thread-safe pool of persistent httplib::ClientImpl instances.
 // Clients are checked out via acquire(), used, and returned via release().
 class ConnectionPool {
 public:
@@ -23,10 +23,10 @@ public:
     ~ConnectionPool();
 
     // Check out a client. Blocks if all clients are in use.
-    std::unique_ptr<httplib::Client> acquire();
+    std::unique_ptr<httplib::ClientImpl> acquire();
 
     // Return a client to the pool.
-    void release(std::unique_ptr<httplib::Client> client);
+    void release(std::unique_ptr<httplib::ClientImpl> client);
 
     uint32_t poolSize() const { return poolSize_; }
     uint32_t available() const;
@@ -34,11 +34,11 @@ public:
 private:
     std::string endpoint_;
     uint32_t poolSize_;
-    std::queue<std::unique_ptr<httplib::Client>> clients_;
+    std::queue<std::unique_ptr<httplib::ClientImpl>> clients_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
 
-    std::unique_ptr<httplib::Client> createClient() const;
+    std::unique_ptr<httplib::ClientImpl> createClient() const;
 };
 
 // RAII wrapper: acquires a client on construction, releases on destruction.
@@ -55,12 +55,12 @@ public:
     PooledClient(PooledClient&& other) noexcept;
     PooledClient& operator=(PooledClient&& other) noexcept;
 
-    httplib::Client* operator->() { return client_.get(); }
-    httplib::Client& operator*() { return *client_; }
+    httplib::ClientImpl* operator->() { return client_.get(); }
+    httplib::ClientImpl& operator*() { return *client_; }
 
 private:
     ConnectionPool* pool_;
-    std::unique_ptr<httplib::Client> client_;
+    std::unique_ptr<httplib::ClientImpl> client_;
 };
 
 } // namespace tiered

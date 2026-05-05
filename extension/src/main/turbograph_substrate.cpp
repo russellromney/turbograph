@@ -27,6 +27,8 @@ uint64_t TurbographSubstrate::syncCheckpointedBase() {
     if (!db_) {
         throw std::runtime_error("TurbographSubstrate: checkpoint requires a database");
     }
+    auto& tfs = requireTfs();
+    (void)tfs.manifestBytes();
 
     main::Connection conn(db_);
     auto result = conn.query("CHECKPOINT");
@@ -38,7 +40,7 @@ uint64_t TurbographSubstrate::syncCheckpointedBase() {
         (void)result->getNext();
     }
 
-    return requireTfs().syncAndGetVersion();
+    return tfs.syncAndGetVersion();
 }
 
 uint64_t TurbographSubstrate::syncBaseForTestWithoutCheckpoint() {

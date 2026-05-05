@@ -1,6 +1,5 @@
 #pragma once
 
-#include "connection_pool.h"
 #include "manifest.h"
 
 #include <atomic>
@@ -10,10 +9,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-
-namespace httplib {
-class Client;
-}
 
 namespace lbug {
 namespace tiered {
@@ -42,8 +37,7 @@ struct RangeResponse {
     std::vector<uint8_t> data;
 };
 
-// Minimal S3 client for tiered storage. Uses httplib + SigV4.
-// Connection pool for parallel operations.
+// Minimal S3 client for tiered storage. Uses libcurl + SigV4.
 class S3Client {
 public:
     explicit S3Client(S3Config config);
@@ -87,6 +81,7 @@ public:
 
     // Expose prefix for callers that need to build S3 paths.
     const std::string& prefix() const { return config_.prefix; }
+    const std::string& region() const { return config_.region; }
 
 private:
     // SigV4 signing.
@@ -119,7 +114,6 @@ private:
     static std::string sortQueryParams(const std::string& rawQuery);
 
     S3Config config_;
-    std::shared_ptr<ConnectionPool> pool_;
     std::string host_; // Parsed from endpoint, cached.
 };
 

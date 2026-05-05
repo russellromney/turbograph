@@ -23,7 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
+#include <stdexcept>
 
 using namespace lbug::tiered;
 using namespace lbug::common;
@@ -73,6 +75,13 @@ static void cleanupS3(const TieredConfig& cfg) {
     s3.deleteObject(cfg.s3.prefix + "/manifest.json");
     auto keys = s3.listObjects(cfg.s3.prefix + "/pg/");
     for (auto& k : keys) s3.deleteObject(k);
+}
+
+static void writeLocalManifest(const std::filesystem::path& cacheDir, const Manifest& manifest) {
+    std::filesystem::create_directories(cacheDir);
+    auto json = manifest.toJSON();
+    std::ofstream f(cacheDir / "manifest.json", std::ios::binary | std::ios::trunc);
+    f.write(json.data(), json.size());
 }
 
 // Fill page with a recognizable pattern: byte 0 = marker, rest = pageIdx.
@@ -522,6 +531,178 @@ static void testColdRestartSizeAndRead() {
     std::printf("  PASS: testColdRestartSizeAndRead\n");
 }
 
+// --- Test 11: corrupt remote manifest is rejected before local adoption ---
+static void testColdOpenRejectsUnreadableRemoteManifestBeforePersist() {
+    auto dir = tmpDir("_bad_remote_manifest");
+    auto cfg = makeConfig(dir, 4);
+    cleanupS3(cfg);
+
+    Manifest manifest;
+    manifest.version = 99;
+    manifest.pageCount = 4;
+    manifest.pageSize = PAGE_SIZE;
+    manifest.pagesPerGroup = 4;
+    manifest.pageGroupKeys = {cfg.s3.prefix + "/pg/missing_v99"};
+
+    {
+        S3Client s3(cfg.s3);
+        assert(s3.putManifest(manifest));
+    }
+
+    bool threw = false;
+    try {
+        TieredFileSystem vfs(cfg);
+        (void)vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+    assert(threw);
+    assert(!std::filesystem::exists(std::filesystem::path(cfg.cacheDir) / "manifest.json"));
+
+    cleanupS3(cfg);
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testColdOpenRejectsUnreadableRemoteManifestBeforePersist\n");
+}
+
+// --- Test 12: same-length corrupt seekable frames are rejected before adoption ---
+static void testColdOpenRejectsCorruptSeekableFrameBeforePersist() {
+    auto dir = tmpDir("_bad_seekable_frame");
+    auto cfg = makeConfig(dir, 4);
+    cleanupS3(cfg);
+
+    auto key = cfg.s3.prefix + "/pg/0_v100";
+    std::vector<uint8_t> corrupt(128, 0x42);
+    {
+        S3Client s3(cfg.s3);
+        assert(s3.putObject(key, corrupt.data(), corrupt.size()));
+
+        Manifest manifest;
+        manifest.version = 100;
+        manifest.pageCount = 4;
+        manifest.pageSize = PAGE_SIZE;
+        manifest.pagesPerGroup = 4;
+        manifest.subPagesPerFrame = 2;
+        manifest.pageGroupKeys = {key};
+        manifest.frameTables = {{{0, 64, 2}, {64, 64, 2}}};
+        assert(s3.putManifest(manifest));
+    }
+
+    bool threw = false;
+    try {
+        TieredFileSystem vfs(cfg);
+        (void)vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+    assert(threw);
+    assert(!std::filesystem::exists(std::filesystem::path(cfg.cacheDir) / "manifest.json"));
+
+    cleanupS3(cfg);
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testColdOpenRejectsCorruptSeekableFrameBeforePersist\n");
+}
+
+// --- Test 13: same-length corrupt override frames are rejected before adoption ---
+static void testColdOpenRejectsCorruptOverrideFrameBeforePersist() {
+    auto dir = tmpDir("_bad_override_frame");
+    auto cfg = makeConfig(dir, 4);
+    cleanupS3(cfg);
+
+    auto overrideKey = cfg.s3.prefix + "/pg/0_f0_v101";
+    std::vector<uint8_t> corrupt(64, 0x24);
+    {
+        S3Client s3(cfg.s3);
+        assert(s3.putObject(overrideKey, corrupt.data(), corrupt.size()));
+
+        Manifest manifest;
+        manifest.version = 101;
+        manifest.pageCount = 4;
+        manifest.pageSize = PAGE_SIZE;
+        manifest.pagesPerGroup = 4;
+        manifest.subPagesPerFrame = 4;
+        manifest.pageGroupKeys = {""};
+        manifest.subframeOverrides.resize(1);
+        SubframeOverride overrideFrame;
+        overrideFrame.key = overrideKey;
+        overrideFrame.entry = {0, 64, 4};
+        manifest.subframeOverrides[0][0] = overrideFrame;
+        assert(s3.putManifest(manifest));
+    }
+
+    bool threw = false;
+    try {
+        TieredFileSystem vfs(cfg);
+        (void)vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+    assert(threw);
+    assert(!std::filesystem::exists(std::filesystem::path(cfg.cacheDir) / "manifest.json"));
+
+    cleanupS3(cfg);
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testColdOpenRejectsCorruptOverrideFrameBeforePersist\n");
+}
+
+// --- Test 14: interrupted remote adoption cannot trust stale local cache bits ---
+static void testInterruptedRemoteAdoptClearsStaleCacheBeforeManifestIsTrusted() {
+    auto dir = tmpDir("_interrupted_adopt");
+    auto cfg = makeConfig(dir, 4);
+    cleanupS3(cfg);
+
+    auto cacheDir = std::filesystem::path(cfg.cacheDir);
+
+    {
+        TieredFileSystem vfs(cfg);
+        auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+        auto oldPage = makePage(0x51, 0);
+        fi->writeFile(oldPage.data(), PAGE_SIZE, 0);
+        fi->syncFile();
+    }
+
+    auto publisherDir = tmpDir("_interrupted_adopt_publisher");
+    auto publisherCfg = cfg;
+    publisherCfg.cacheDir = (publisherDir / "cache").string();
+    {
+        TieredFileSystem vfs(publisherCfg);
+        auto fi = vfs.openFile(publisherCfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+        auto newPage = makePage(0xA7, 0);
+        fi->writeFile(newPage.data(), PAGE_SIZE, 0);
+        fi->syncFile();
+    }
+
+    S3Client s3(cfg.s3);
+    auto remoteManifest = s3.getManifest();
+    assert(remoteManifest.has_value());
+    assert(remoteManifest->version > 0);
+
+    // Simulate the historical crash window: final manifest already says "new",
+    // but data.cache/page_bitmap still contain the old page and the adoption
+    // marker was never removed.
+    writeLocalManifest(cacheDir, *remoteManifest);
+    {
+        std::ofstream marker(cacheDir / "manifest.adopting", std::ios::binary | std::ios::trunc);
+        marker << remoteManifest->version;
+    }
+
+    {
+        TieredFileSystem vfs(cfg);
+        auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+        std::vector<uint8_t> buf(PAGE_SIZE, 0);
+        fi->readFromFile(buf.data(), PAGE_SIZE, 0);
+        verifyPage(buf.data(), 0xA7, 0);
+        assert(!std::filesystem::exists(cacheDir / "manifest.adopting"));
+    }
+
+    cleanupS3(cfg);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(publisherDir);
+    std::printf("  PASS: testInterruptedRemoteAdoptClearsStaleCacheBeforeManifestIsTrusted\n");
+}
+
 int main() {
     std::printf("=== Cold-Open Tests ===\n");
 
@@ -535,7 +716,11 @@ int main() {
     testColdFileOrPathExists();
     testColdRestartSeekable();
     testColdRestartSizeAndRead();
+    testColdOpenRejectsUnreadableRemoteManifestBeforePersist();
+    testColdOpenRejectsCorruptSeekableFrameBeforePersist();
+    testColdOpenRejectsCorruptOverrideFrameBeforePersist();
+    testInterruptedRemoteAdoptClearsStaleCacheBeforeManifestIsTrusted();
 
-    std::printf("  All 10 cold-open tests passed.\n");
+    std::printf("  All 14 cold-open tests passed.\n");
     return 0;
 }

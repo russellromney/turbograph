@@ -6,17 +6,70 @@
 #include <cstring>
 #include <ctime>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
 
-#include "httplib.h"
-
+#include <curl/curl.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 
 namespace lbug {
 namespace tiered {
+
+namespace {
+
+void ensureCurlInitialized() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    });
+}
+
+size_t curlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    auto bytes = size * nmemb;
+    out->append(ptr, bytes);
+    return bytes;
+}
+
+struct CurlUploadBuffer {
+    const uint8_t* data = nullptr;
+    uint64_t size = 0;
+    uint64_t offset = 0;
+};
+
+size_t curlReadCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* upload = static_cast<CurlUploadBuffer*>(userdata);
+    auto capacity = static_cast<uint64_t>(size * nmemb);
+    auto remaining = upload->size - upload->offset;
+    auto bytes = std::min(capacity, remaining);
+    if (bytes > 0) {
+        std::memcpy(ptr, upload->data + upload->offset, static_cast<size_t>(bytes));
+        upload->offset += bytes;
+    }
+    return static_cast<size_t>(bytes);
+}
+
+std::string normalizeEndpointForUrl(const std::string& endpoint) {
+    std::string normalized = endpoint;
+    if (normalized.rfind("http://", 0) != 0 &&
+        normalized.rfind("https://", 0) != 0) {
+        normalized = "https://" + normalized;
+    }
+    while (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    return normalized;
+}
+
+struct CurlResponse {
+    long status = 0;
+    std::string body;
+};
+
+} // namespace
 
 // --- Crypto helpers ---
 
@@ -187,13 +240,84 @@ static std::string parseHost(const std::string& endpoint) {
 }
 
 S3Client::S3Client(S3Config config) : config_(std::move(config)) {
+    ensureCurlInitialized();
     host_ = parseHost(config_.endpoint);
-    pool_ = std::make_shared<ConnectionPool>(config_.endpoint, config_.poolSize);
 }
 
 S3Client::~S3Client() = default;
 
 // --- Core I/O primitives (pooled) ---
+
+static std::optional<CurlResponse> performCurlRequest(const std::string& endpoint,
+    const std::string& path, const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& method, const uint8_t* body, uint64_t size) {
+    ensureCurlInitialized();
+    auto* curl = curl_easy_init();
+    if (!curl) {
+        return std::nullopt;
+    }
+
+    std::string responseBody;
+    auto url = normalizeEndpointForUrl(endpoint) + path;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+
+    struct curl_slist* headerList = nullptr;
+    for (const auto& [key, value] : headers) {
+        auto line = key + ": " + value;
+        headerList = curl_slist_append(headerList, line.c_str());
+    }
+    if (method == "PUT") {
+        // Avoid libcurl's default 100-continue dance for larger S3 uploads.
+        // It is unnecessary here and can make tests look hung when a backend
+        // or proxy delays the interim response.
+        headerList = curl_slist_append(headerList, "Expect:");
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+
+    CurlUploadBuffer upload{body, size, 0};
+    if (method == "PUT") {
+        curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+        curl_easy_setopt(curl, CURLOPT_READFUNCTION, curlReadCallback);
+        curl_easy_setopt(curl, CURLOPT_READDATA, &upload);
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(size));
+    } else if (method == "DELETE") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    }
+
+    auto code = curl_easy_perform(curl);
+    long status = 0;
+    if (code == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    }
+
+    curl_slist_free_all(headerList);
+    curl_easy_cleanup(curl);
+
+    if (code != CURLE_OK) {
+        return std::nullopt;
+    }
+    return CurlResponse{status, std::move(responseBody)};
+}
+
+std::optional<CurlResponse> performSignedRequest(const S3Config& config,
+    const std::string& host, const std::string& payloadHash, const std::string& date,
+    const std::string& authorization, const std::string& path,
+    const std::string& method, const uint8_t* body, uint64_t size,
+    const std::vector<std::pair<std::string, std::string>>& extraHeaders = {}) {
+    std::vector<std::pair<std::string, std::string>> httpHeaders = {
+        {"Host", host},
+        {"x-amz-content-sha256", payloadHash},
+        {"x-amz-date", date},
+        {"Authorization", authorization},
+    };
+    httpHeaders.insert(httpHeaders.end(), extraHeaders.begin(), extraHeaders.end());
+    return performCurlRequest(config.endpoint, path, httpHeaders, method, body, size);
+}
 
 std::optional<std::vector<uint8_t>> S3Client::doGet(const std::string& key,
     const std::string& rangeHeader) {
@@ -201,16 +325,14 @@ std::optional<std::vector<uint8_t>> S3Client::doGet(const std::string& key,
     auto emptyHash = sha256Hex(reinterpret_cast<const uint8_t*>(""), 0);
     auto headers = signRequest("GET", objectPath, emptyHash);
 
-    httplib::Headers httpHeaders = {{"Host", headers.host},
-        {"x-amz-content-sha256", headers.payloadHash}, {"x-amz-date", headers.date},
-        {"Authorization", headers.authorization}};
-
+    std::vector<std::pair<std::string, std::string>> extraHeaders;
     if (!rangeHeader.empty()) {
-        httpHeaders.emplace("Range", rangeHeader);
+        extraHeaders.emplace_back("Range", rangeHeader);
     }
 
-    PooledClient client(*pool_);
-    auto res = client->Get(objectPath, httpHeaders);
+    auto res = performSignedRequest(config_, headers.host, headers.payloadHash,
+        headers.date, headers.authorization, objectPath, "GET", nullptr, 0,
+        extraHeaders);
     if (!res) {
         return std::nullopt;
     }
@@ -231,13 +353,12 @@ bool S3Client::doPut(const std::string& key, const uint8_t* data, uint64_t size)
     auto payloadHash = sha256Hex(data, size);
     auto headers = signRequest("PUT", objectPath, payloadHash);
 
-    httplib::Headers httpHeaders = {{"Host", headers.host},
-        {"x-amz-content-sha256", headers.payloadHash}, {"x-amz-date", headers.date},
-        {"Authorization", headers.authorization}};
-
-    PooledClient client(*pool_);
-    auto res = client->Put(objectPath, httpHeaders,
-        reinterpret_cast<const char*>(data), size, "application/octet-stream");
+    auto res = performSignedRequest(config_, headers.host, headers.payloadHash,
+        headers.date, headers.authorization, objectPath, "PUT", data, size);
+    if (std::getenv("TURBOGRAPH_DEBUG_CONFIG") && (!res || res->status < 200 || res->status >= 300)) {
+        std::fprintf(stderr, "[S3::putObject] status=%ld key=%s body=%.300s\n",
+            res ? res->status : 0, key.c_str(), res ? res->body.c_str() : "");
+    }
     return res && res->status >= 200 && res->status < 300;
 }
 
@@ -246,12 +367,8 @@ bool S3Client::doDelete(const std::string& key) {
     auto emptyHash = sha256Hex(reinterpret_cast<const uint8_t*>(""), 0);
     auto headers = signRequest("DELETE", objectPath, emptyHash);
 
-    httplib::Headers httpHeaders = {{"Host", headers.host},
-        {"x-amz-content-sha256", headers.payloadHash}, {"x-amz-date", headers.date},
-        {"Authorization", headers.authorization}};
-
-    PooledClient client(*pool_);
-    auto res = client->Delete(objectPath, httpHeaders);
+    auto res = performSignedRequest(config_, headers.host, headers.payloadHash,
+        headers.date, headers.authorization, objectPath, "DELETE", nullptr, 0);
     return res && (res->status == 204 || res->status == 200 || res->status == 404);
 }
 
@@ -289,35 +406,39 @@ std::vector<RangeResponse> S3Client::getObjectRanges(const std::vector<RangeRequ
         return {};
     }
 
-    // Parallel range requests. Each thread acquires a pooled connection —
-    // if pool is exhausted, threads block until a connection is available.
-    // This provides natural backpressure without wave batching.
+    // Parallel range requests. Bound worker count by poolSize so callers do
+    // not accidentally create one OS thread/socket per page group.
     std::vector<RangeResponse> results;
     std::mutex resultsMu;
+    std::atomic<size_t> next{0};
     std::vector<std::thread> threads;
-    threads.reserve(requests.size());
+    auto workerCount = std::max<uint32_t>(1,
+        std::min<uint32_t>(config_.poolSize, static_cast<uint32_t>(requests.size())));
+    threads.reserve(workerCount);
 
-    for (auto& req : requests) {
-        threads.emplace_back([this, &req, &results, &resultsMu]() {
-            auto objectPath = "/" + config_.bucket + "/" + req.key;
-            auto emptyHash = sha256Hex(reinterpret_cast<const uint8_t*>(""), 0);
-            auto headers = signRequest("GET", objectPath, emptyHash);
+    for (uint32_t worker = 0; worker < workerCount; worker++) {
+        threads.emplace_back([this, &requests, &results, &resultsMu, &next]() {
+            while (true) {
+                auto idx = next.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= requests.size()) break;
+                const auto& req = requests[idx];
+                auto objectPath = "/" + config_.bucket + "/" + req.key;
+                auto emptyHash = sha256Hex(reinterpret_cast<const uint8_t*>(""), 0);
+                auto headers = signRequest("GET", objectPath, emptyHash);
 
-            auto rangeStr = "bytes=" + std::to_string(req.offset) + "-" +
-                            std::to_string(req.offset + req.length - 1);
+                auto rangeStr = "bytes=" + std::to_string(req.offset) + "-" +
+                                std::to_string(req.offset + req.length - 1);
 
-            httplib::Headers httpHeaders = {{"Host", headers.host},
-                {"x-amz-content-sha256", headers.payloadHash}, {"x-amz-date", headers.date},
-                {"Authorization", headers.authorization}, {"Range", rangeStr}};
-
-            PooledClient client(*pool_);
-            auto res = client->Get(objectPath, httpHeaders);
-            if (res && (res->status == 200 || res->status == 206)) {
-                fetchCount.fetch_add(1, std::memory_order_relaxed);
-                fetchBytes.fetch_add(res->body.size(), std::memory_order_relaxed);
-                std::lock_guard lock(resultsMu);
-                results.push_back(
-                    {req.tag, std::vector<uint8_t>(res->body.begin(), res->body.end())});
+                auto res = performSignedRequest(config_, headers.host, headers.payloadHash,
+                    headers.date, headers.authorization, objectPath, "GET",
+                    nullptr, 0, {{"Range", rangeStr}});
+                if (res && (res->status == 200 || res->status == 206)) {
+                    fetchCount.fetch_add(1, std::memory_order_relaxed);
+                    fetchBytes.fetch_add(res->body.size(), std::memory_order_relaxed);
+                    std::lock_guard lock(resultsMu);
+                    results.push_back(
+                        {req.tag, std::vector<uint8_t>(res->body.begin(), res->body.end())});
+                }
             }
         });
     }
@@ -358,19 +479,14 @@ std::vector<std::string> S3Client::listObjects(const std::string& prefix) {
         auto emptyHash = sha256Hex(reinterpret_cast<const uint8_t*>(""), 0);
         auto headers = signRequest("GET", queryPath, emptyHash);
 
-        httplib::Headers httpHeaders = {{"Host", headers.host},
-            {"x-amz-content-sha256", headers.payloadHash},
-            {"x-amz-date", headers.date},
-            {"Authorization", headers.authorization}};
-
-        PooledClient client(*pool_);
-        auto res = client->Get(queryPath, httpHeaders);
+        auto res = performSignedRequest(config_, headers.host, headers.payloadHash,
+            headers.date, headers.authorization, queryPath, "GET", nullptr, 0);
         if (!res) {
             std::fprintf(stderr, "[S3::listObjects] no response for prefix=%s\n", prefix.c_str());
             break;
         }
         if (res->status != 200) {
-            std::fprintf(stderr, "[S3::listObjects] status=%d prefix=%s body=%.300s\n",
+            std::fprintf(stderr, "[S3::listObjects] status=%ld prefix=%s body=%.300s\n",
                 res->status, prefix.c_str(), res->body.c_str());
             break;
         }

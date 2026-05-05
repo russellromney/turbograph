@@ -212,7 +212,7 @@ static void testApplyManifestNewerVersion() {
     std::printf("  PASS: testApplyManifestNewerVersion\n");
 }
 
-// --- Test: applyRemoteManifest with older version (crash recovery) ---
+// --- Test: applyRemoteManifest with older version is a remote no-op ---
 static void testApplyManifestOlderVersion() {
     auto dir = tmpDir("apply_older");
     auto cfg = makeConfig(dir);
@@ -220,21 +220,29 @@ static void testApplyManifestOlderVersion() {
 
     auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
 
-    // Write some data first.
-    std::vector<uint8_t> page(PAGE_SIZE, 0xDD);
-    fi->writeFile(page.data(), PAGE_SIZE, 0);
+    Manifest current;
+    current.version = 5;
+    current.pageCount = 0;
+    current.pageSize = PAGE_SIZE;
+    current.pagesPerGroup = PAGES_PER_GROUP;
+    current.journalSeq = 500;
+    assert(vfs.applyRemoteManifest(current.toJSON()) == 5);
 
-    // Apply a manifest that simulates local being "ahead" (crash recovery).
-    // Current is version 0, applying version 0 should not crash.
-    Manifest remote;
-    remote.version = 0;
-    remote.pageCount = 0;
-    remote.pageSize = PAGE_SIZE;
-    remote.pagesPerGroup = PAGES_PER_GROUP;
-    auto json = remote.toJSON();
+    auto manifestPath = std::filesystem::path(cfg.cacheDir) / "manifest.json";
+    auto manifestBefore = readTextFileIfExists(manifestPath);
 
-    auto version = vfs.applyRemoteManifest(json);
-    assert(version == 0);
+    Manifest stale;
+    stale.version = 4;
+    stale.pageCount = PAGES_PER_GROUP;
+    stale.pageSize = PAGE_SIZE;
+    stale.pagesPerGroup = PAGES_PER_GROUP;
+    stale.pageGroupKeys = {"pg/missing_v4"};
+    stale.journalSeq = 400;
+
+    auto version = vfs.applyRemoteManifest(stale.toJSON());
+    assert(version == 5);
+    assert(vfs.getManifestVersion() == 5);
+    assert(readTextFileIfExists(manifestPath) == manifestBefore);
 
     std::filesystem::remove_all(dir);
     std::printf("  PASS: testApplyManifestOlderVersion\n");

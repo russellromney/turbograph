@@ -210,6 +210,10 @@ static std::string envFirst(std::initializer_list<const char*> names) {
     return "";
 }
 
+static bool isAwsS3Endpoint(const std::string& endpoint) {
+    return endpoint.find("amazonaws.com") != std::string::npos;
+}
+
 static void applyEnvFallbacks(tiered::TieredConfig& cfg) {
     if (cfg.s3.accessKey.empty()) {
         cfg.s3.accessKey = envFirst({
@@ -246,13 +250,16 @@ static void applyEnvFallbacks(tiered::TieredConfig& cfg) {
             "AWS_PREFIX",
         });
     }
-    if (cfg.s3.region.empty()) {
-        cfg.s3.region = envFirst({
-            "TURBOGRAPH_S3_REGION",
-            "AWS_REGION",
-            "AWS_DEFAULT_REGION",
-        });
-        if (cfg.s3.region.empty()) cfg.s3.region = "auto";
+    auto turbographRegion = envFirst({"TURBOGRAPH_S3_REGION"});
+    if (!turbographRegion.empty()) {
+        cfg.s3.region = turbographRegion;
+    } else if (cfg.s3.region.empty()) {
+        auto awsRegion = envFirst({"AWS_REGION", "AWS_DEFAULT_REGION"});
+        cfg.s3.region = !awsRegion.empty() && isAwsS3Endpoint(cfg.s3.endpoint)
+            ? awsRegion : "auto";
+    } else if (cfg.s3.region == "auto" && isAwsS3Endpoint(cfg.s3.endpoint)) {
+        auto awsRegion = envFirst({"AWS_REGION", "AWS_DEFAULT_REGION"});
+        if (!awsRegion.empty()) cfg.s3.region = awsRegion;
     }
     if (cfg.dataFilePath.empty()) {
         cfg.dataFilePath = envFirst({"TURBOGRAPH_DATA_FILE"});
@@ -349,8 +356,8 @@ void TurbographExtension::load(main::ClientContext* context) {
     // Register the raw metadata parser callback on the TFS.
     // This runs during openFile() after structural pages are fetched,
     // building a page-to-table map for per-table prefetch scheduling.
-    if (tfs) {
-        tfs->setMetadataParser([](const uint8_t* data, size_t len) {
+    if (activeTfs) {
+        activeTfs->setMetadataParser([](const uint8_t* data, size_t len) {
             return parseMetadataPages(data, len);
         });
     }

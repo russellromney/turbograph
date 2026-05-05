@@ -39,6 +39,7 @@ else ()
 endif ()
 
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
 add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
 
@@ -103,6 +104,7 @@ if(COMMAND build_extension_lib)
     target_link_libraries(lbug_${EXTENSION_LIB_NAME}_extension
             PRIVATE
             ${OPENSSL_LIBRARIES}
+            CURL::libcurl
             ${ZSTD_LIB})
 endif()
 

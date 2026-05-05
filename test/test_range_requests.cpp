@@ -6,6 +6,7 @@
 //   TIGRIS_BUCKET (defaults to cinch-data)
 
 #include "httplib.h"  // Must come before connection_pool.h for complete type.
+#include "connection_pool.h"
 #include "s3_client.h"
 
 #include <algorithm>

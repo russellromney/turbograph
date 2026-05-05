@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 using namespace lbug;
@@ -36,6 +37,29 @@ static std::string queryScalar(main::Connection& conn, const std::string& cypher
     if (!result->hasNext()) return "";
     auto row = result->getNext();
     return row->getValue(0)->toString();
+}
+
+struct EnvSnapshot {
+    std::string name;
+    bool hadValue = false;
+    std::string value;
+};
+
+static EnvSnapshot snapshotEnv(const char* name) {
+    if (auto* value = std::getenv(name)) {
+        return {name, true, value};
+    }
+    return {name, false, ""};
+}
+
+static void restoreEnv(const std::vector<EnvSnapshot>& snapshots) {
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.hadValue) {
+            setenv(snapshot.name.c_str(), snapshot.value.c_str(), 1);
+        } else {
+            unsetenv(snapshot.name.c_str());
+        }
+    }
 }
 
 // --- Test: extension loads without S3 credentials ---
@@ -170,7 +194,7 @@ static void testDirectSubstrateWorksWithoutUdfs() {
     std::printf("  PASS: testDirectSubstrateWorksWithoutUdfs\n");
 }
 
-// --- Test: direct substrate checkpoints graph mutations before base sync ---
+// --- Test: direct checkpointed sync refuses to pass without an active TFS file ---
 static void testDirectSubstrateCheckpointsBeforeSync() {
     main::SystemConfig sysCfg;
     main::Database db(":memory:", sysCfg);
@@ -192,11 +216,66 @@ static void testDirectSubstrateCheckpointsBeforeSync() {
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
 
     turbograph_extension::TurbographSubstrate substrate(&db, tfsPtr.get());
-    assert(substrate.syncCheckpointedBase() == 0);
+    bool threw = false;
+    try {
+        (void)substrate.syncCheckpointedBase();
+    } catch (const std::exception& e) {
+        threw = true;
+        assert(std::string(e.what()).find("no active file") != std::string::npos);
+    }
+    assert(threw);
 
     std::filesystem::remove_all(cfg.cacheDir);
 
     std::printf("  PASS: testDirectSubstrateCheckpointsBeforeSync\n");
+}
+
+// --- Test: generic AWS_REGION must not override Tigris/compat auto region ---
+static void testTigrisEnvKeepsAutoRegion() {
+    std::vector<EnvSnapshot> env = {
+        snapshotEnv("TURBOGRAPH_S3_ACCESS_KEY"),
+        snapshotEnv("TURBOGRAPH_S3_SECRET_KEY"),
+        snapshotEnv("TURBOGRAPH_S3_ENDPOINT"),
+        snapshotEnv("TURBOGRAPH_S3_BUCKET"),
+        snapshotEnv("TURBOGRAPH_S3_PREFIX"),
+        snapshotEnv("TURBOGRAPH_S3_REGION"),
+        snapshotEnv("TURBOGRAPH_DATA_FILE"),
+        snapshotEnv("TURBOGRAPH_CACHE_DIR"),
+        snapshotEnv("AWS_REGION"),
+        snapshotEnv("AWS_DEFAULT_REGION"),
+    };
+
+    auto tmpDir = std::filesystem::temp_directory_path() /
+        ("turbograph_region_env_" + std::to_string(getpid()));
+    std::filesystem::remove_all(tmpDir);
+    std::filesystem::create_directories(tmpDir);
+
+    setenv("TURBOGRAPH_S3_ACCESS_KEY", "ak", 1);
+    setenv("TURBOGRAPH_S3_SECRET_KEY", "sk", 1);
+    setenv("TURBOGRAPH_S3_ENDPOINT", "https://fly.storage.tigris.dev", 1);
+    setenv("TURBOGRAPH_S3_BUCKET", "bucket", 1);
+    setenv("TURBOGRAPH_S3_PREFIX", "prefix", 1);
+    unsetenv("TURBOGRAPH_S3_REGION");
+    setenv("TURBOGRAPH_DATA_FILE", (tmpDir / "data.kz").c_str(), 1);
+    setenv("TURBOGRAPH_CACHE_DIR", (tmpDir / "cache").c_str(), 1);
+    setenv("AWS_REGION", "us-east-1", 1);
+    unsetenv("AWS_DEFAULT_REGION");
+
+    {
+        main::SystemConfig sysCfg;
+        main::Database db(":memory:", sysCfg);
+        auto ctx = main::ClientContext(&db);
+        turbograph_extension::TurbographExtension::load(&ctx);
+        auto* tfs = turbograph_extension::TurbographExtension::tfsForDatabase(&db);
+        assert(tfs);
+        assert(tfs->s3().region() == "auto");
+        turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
+    }
+
+    std::filesystem::remove_all(tmpDir);
+    restoreEnv(env);
+
+    std::printf("  PASS: testTigrisEnvKeepsAutoRegion\n");
 }
 
 // --- Test: config_set with invalid key returns error ---
@@ -550,6 +629,7 @@ int main() {
     testPerDbRegistryDoesNotFallbackAcrossDatabases();
     testDirectSubstrateWorksWithoutUdfs();
     testDirectSubstrateCheckpointsBeforeSync();
+    testTigrisEnvKeepsAutoRegion();
     testConfigSetUnknownKey();
     testConfigSetGetRoundTrip();
     testConfigSetBadFloat();
@@ -560,6 +640,6 @@ int main() {
     testBuildTablePageMap();
     testPerTableScheduleSelection();
 
-    std::printf("  All 15 extension tests passed.\n");
+    std::printf("  All 16 extension tests passed.\n");
     return 0;
 }

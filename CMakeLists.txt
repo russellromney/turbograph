@@ -11,6 +11,7 @@ option(BUILD_BENCH "Build cypher benchmark (requires LadybugDB)" OFF)
 # --- Dependencies ---
 
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 find_package(PkgConfig QUIET)
 
 # Find zstd via pkg-config or cmake, fall back to -lzstd.
@@ -97,6 +98,7 @@ endif()
 target_link_libraries(turbograph
     PUBLIC
     ${OPENSSL_LIBRARIES}
+    CURL::libcurl
     ${ZSTD_LIBRARIES}
     pthread)
 

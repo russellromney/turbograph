@@ -120,7 +120,8 @@ The extension compiles against LadybugDB headers (requires `LADYBUG_DIR`). The c
 ## Dependencies
 
 - C++20 compiler (clang-19+ or GCC 13+)
-- OpenSSL (S3 SigV4 signing + httplib TLS)
+- OpenSSL (S3 SigV4 signing)
+- libcurl (S3 HTTP/TLS transport)
 - zstd (compression)
 - LadybugDB (for extension + benchmark)
 

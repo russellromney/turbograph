@@ -406,6 +406,7 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
             path.c_str(), config_.dataFilePath.c_str(), config_.cacheDir.c_str());
     }
     auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
+    auto adoptMarkerPath = std::filesystem::path(config_.cacheDir) / "manifest.adopting";
     auto bitmapPath = std::filesystem::path(config_.cacheDir) / "page_bitmap";
     auto localFilePath = std::filesystem::path(config_.cacheDir) / "data.cache";
 
@@ -417,8 +418,13 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
     Manifest m;
     bool manifestFound = false;
     bool needCacheInvalidation = false;
+    bool forceFullCacheInvalidation = false;
     Manifest localManifest;
     bool hasLocalManifest = false;
+    bool localManifestUnreadable = false;
+    bool interruptedRemoteAdopt = std::filesystem::exists(adoptMarkerPath);
+    bool localSidecarsExist =
+        std::filesystem::exists(bitmapPath) || std::filesystem::exists(localFilePath);
 
     if (std::filesystem::exists(manifestPath)) {
         std::ifstream f(manifestPath, std::ios::binary);
@@ -427,6 +433,8 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
         if (parsed.has_value()) {
             localManifest = *parsed;
             hasLocalManifest = true;
+        } else {
+            localManifestUnreadable = true;
         }
     }
 
@@ -439,6 +447,10 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
             // Versions match: cache is warm.
             m = localManifest;
             manifestFound = true;
+            if (interruptedRemoteAdopt) {
+                needCacheInvalidation = true;
+                forceFullCacheInvalidation = true;
+            }
         } else if (s3Manifest->version > localManifest.version) {
             // S3 is newer: use S3 manifest, invalidate changed groups.
             m = *s3Manifest;
@@ -450,6 +462,7 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
             m = *s3Manifest;
             manifestFound = true;
             needCacheInvalidation = true;
+            forceFullCacheInvalidation = true;
         }
     } else if (hasLocalManifest && !s3Manifest.has_value()) {
         // Only local exists (e.g. fresh upload not yet committed, or offline).
@@ -459,22 +472,21 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
         // Only S3 exists: cold open.
         m = *s3Manifest;
         manifestFound = true;
+        if (interruptedRemoteAdopt || localManifestUnreadable || localSidecarsExist) {
+            needCacheInvalidation = true;
+            forceFullCacheInvalidation = true;
+        }
     } else {
         // Neither exists: new database.
         m.pageSize = config_.pageSize;
         m.pagesPerGroup = config_.pagesPerGroup;
     }
 
-    // Persist the manifest locally if we used S3.
-    if (manifestFound && (!hasLocalManifest || needCacheInvalidation)) {
-        std::ofstream f(manifestPath, std::ios::binary | std::ios::trunc);
-        auto json = m.toJSON();
-        f.write(json.data(), json.size());
-    }
     if (m.pageSize == 0) m.pageSize = config_.pageSize;
     if (m.pagesPerGroup == 0) m.pagesPerGroup = config_.pagesPerGroup;
 
-    // Reject encrypted database opened without a key.
+    // Reject encrypted database opened without a key before adopting any
+    // remote manifest locally.
     if (m.encrypted && !config_.encryptionKey) {
         throw common::InternalException(
             "Database is encrypted but no encryption key was provided. "
@@ -490,6 +502,19 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
         throw std::runtime_error(
             "Manifest pagesPerGroup " + std::to_string(m.pagesPerGroup) +
             " != config " + std::to_string(config_.pagesPerGroup));
+    }
+
+    // Persist a remote manifest only after proving its referenced objects are
+    // readable. Otherwise a failed cold open can poison restart state with an
+    // adopted manifest whose page data cannot be materialized.
+    bool selectedRemoteManifest = manifestFound && (!hasLocalManifest || needCacheInvalidation);
+    if (selectedRemoteManifest) {
+        if (!manifestObjectsAvailable(m)) {
+            throw std::runtime_error(
+                "openFile: remote manifest references missing page objects");
+        }
+        std::ofstream marker(adoptMarkerPath, std::ios::binary | std::ios::trunc);
+        marker << m.version;
     }
 
     {
@@ -538,10 +563,11 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
 
     activeFileInfo_.store(info.get());
 
-    // Cache invalidation when S3 manifest is newer or local is stale.
-    if (needCacheInvalidation && hasLocalManifest && m.pageCount > 0) {
-        if (localManifest.version > m.version) {
-            // Local "newer" (crash recovery): full invalidation.
+    // Cache invalidation when S3 manifest is newer, local is stale, or a prior
+    // remote-adopt attempt crashed after touching manifest/cache sidecars.
+    if (needCacheInvalidation && m.pageCount > 0) {
+        if (forceFullCacheInvalidation || !hasLocalManifest || localManifest.version > m.version) {
+            // Local "newer" / unknown local state / interrupted adopt: full invalidation.
             info->bitmap->clear();
             info->resetGroupStates();
         } else {
@@ -594,6 +620,19 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
                 }
             }
         }
+        info->bitmap->persist();
+    }
+
+    if (selectedRemoteManifest) {
+        auto tmpPath = manifestPath.string() + ".tmp";
+        auto json = m.toJSON();
+        {
+            std::ofstream mf(tmpPath, std::ios::binary | std::ios::trunc);
+            mf.write(json.data(), json.size());
+            mf.flush();
+        }
+        std::filesystem::rename(tmpPath, manifestPath);
+        std::filesystem::remove(adoptMarkerPath);
     }
 
     // --- Eager-fetch structural pages ---
@@ -1277,15 +1316,72 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
 }
 
 bool TieredFileSystem::manifestObjectsAvailable(const Manifest& manifest) const {
-    std::vector<RangeRequest> requests;
-    requests.reserve(manifest.pageGroupKeys.size());
-
-    uint64_t tag = 0;
-    auto addProbe = [&](const std::string& key, uint64_t offset, uint64_t len) {
-        if (key.empty() || len == 0) {
+    auto validateFrame = [&](std::optional<std::vector<uint8_t>> compressedFrame,
+                             const FrameEntry& entry) {
+        if (entry.len == 0 || entry.pageCount == 0 ||
+            !compressedFrame.has_value() || compressedFrame->size() != entry.len) {
             return false;
         }
-        requests.push_back({key, offset, len, tag++});
+
+        try {
+            std::vector<uint8_t> frameData;
+            if (config_.encryptionKey) {
+                frameData = aes256_gcm_decrypt(compressedFrame->data(),
+                    compressedFrame->size(), *config_.encryptionKey);
+                if (frameData.empty()) return false;
+            } else {
+                frameData = std::move(*compressedFrame);
+            }
+
+            auto rawFrame = decodeFrame(frameData, entry.pageCount, manifest.pageSize);
+            return rawFrame.size() >=
+                static_cast<size_t>(entry.pageCount) * manifest.pageSize;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    auto validateFrameObject = [&](const std::string& key, const FrameEntry& entry) {
+        if (key.empty()) return false;
+        return validateFrame(s3_->getObject(key), entry);
+    };
+
+    auto validateFrameRange = [&](const std::string& key, const FrameEntry& entry) {
+        if (key.empty()) return false;
+        return validateFrame(s3_->getObjectRange(key, entry.offset, entry.len), entry);
+    };
+
+    auto validateLegacyGroup = [&](const std::string& key, uint64_t groupPages) {
+        if (key.empty()) {
+            return false;
+        }
+        auto blob = s3_->getObject(key);
+        if (!blob.has_value() || blob->empty()) {
+            return false;
+        }
+        if (config_.encryptionKey) {
+            auto decrypted = aes256_gcm_decrypt(blob->data(), blob->size(),
+                *config_.encryptionKey);
+            if (decrypted.empty()) return false;
+            *blob = std::move(decrypted);
+        }
+
+        for (uint32_t localIdx = 0; localIdx < groupPages; localIdx++) {
+            auto compressedPage = extractPage(*blob, localIdx, manifest.pagesPerGroup);
+            if (!compressedPage.has_value() || compressedPage->empty()) {
+                return false;
+            }
+            try {
+                auto rawPage = decompressPage(compressedPage->data(),
+                    compressedPage->size(), manifest.pageSize);
+                if (rawPage.size() != manifest.pageSize) {
+                    return false;
+                }
+            } catch (...) {
+                return false;
+            }
+        }
+
         return true;
     };
 
@@ -1326,8 +1422,8 @@ bool TieredFileSystem::manifestObjectsAvailable(const Manifest& manifest) const 
                 bool hasOverride = overrides && overrideIt != overrides->end() &&
                     overrideIt->second.entry.len > 0;
                 if (hasOverride) {
-                    if (overrideIt->second.entry.pageCount == 0 ||
-                        !addProbe(overrideIt->second.key, 0, overrideIt->second.entry.len)) {
+                    if (!validateFrameObject(overrideIt->second.key,
+                            overrideIt->second.entry)) {
                         return false;
                     }
                     continue;
@@ -1338,12 +1434,11 @@ bool TieredFileSystem::manifestObjectsAvailable(const Manifest& manifest) const 
                 }
 
                 const auto& entry = (*frameTable)[frameIdx];
-                if (entry.len == 0 || entry.pageCount == 0 ||
-                    !addProbe(baseKey, entry.offset, entry.len)) {
+                if (!validateFrameRange(baseKey, entry)) {
                     return false;
                 }
             }
-        } else if (!addProbe(baseKey, 0, 1)) {
+        } else if (!validateLegacyGroup(baseKey, groupPages)) {
             return false;
         }
     }
@@ -1351,26 +1446,13 @@ bool TieredFileSystem::manifestObjectsAvailable(const Manifest& manifest) const 
     for (const auto& overrides : manifest.subframeOverrides) {
         for (const auto& [_, overrideFrame] : overrides) {
             if (overrideFrame.entry.len == 0) continue;
-            if (overrideFrame.entry.pageCount == 0 ||
-                !addProbe(overrideFrame.key, 0, overrideFrame.entry.len)) {
+            if (!validateFrameObject(overrideFrame.key, overrideFrame.entry)) {
                 return false;
             }
         }
     }
 
-    if (requests.empty()) {
-        return true;
-    }
-
-    auto responses = s3_->getObjectRanges(requests);
-    std::unordered_set<uint64_t> found;
-    found.reserve(responses.size());
-    for (const auto& response : responses) {
-        if (!response.data.empty()) {
-            found.insert(response.tag);
-        }
-    }
-    return found.size() == requests.size();
+    return true;
 }
 
 // --- readOnePage: sync fetch + async prefetch ---
@@ -2370,8 +2452,8 @@ uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
 
     {
         std::lock_guard lock(ti.manifestMu);
-        if (newManifest.version == ti.manifest.version) {
-            return newManifest.version;
+        if (newManifest.version <= ti.manifest.version) {
+            return ti.manifest.version;
         }
     }
 
@@ -2385,30 +2467,11 @@ uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
     std::lock_guard lock(ti.manifestMu);
     Manifest oldManifest = ti.manifest;
 
-    if (newManifest.version == oldManifest.version) {
-        return newManifest.version;
-    }
-
-    // If S3 version is older or equal, nothing to do (except crash recovery case).
-    if (newManifest.version < oldManifest.version) {
-        // Local is "newer" (crash during write, manifest never published).
-        // Discard local, use S3, invalidate entire cache.
-        ti.bitmap->clear();
-        ti.resetGroupStates();
-        ti.manifest = newManifest;
-
-        // Persist atomically: write tmp then rename.
-        auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
-        auto tmpPath = manifestPath.string() + ".tmp";
-        auto json = newManifest.toJSON();
-        {
-            std::ofstream mf(tmpPath, std::ios::binary | std::ios::trunc);
-            mf.write(json.data(), json.size());
-            mf.flush();
-        }
-        std::filesystem::rename(tmpPath, manifestPath);
-
-        return newManifest.version;
+    // Remote apply is driven by follower polling/notifications. A stale remote
+    // manifest must never roll a live file backward; local-ahead crash recovery
+    // belongs in openFile() when choosing between local and authoritative S3.
+    if (newManifest.version <= oldManifest.version) {
+        return oldManifest.version;
     }
 
     // S3 is newer: diff manifests, invalidate changed groups.
