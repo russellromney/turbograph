@@ -69,7 +69,6 @@ FetchContent_MakeAvailable(httplib)
 include_directories(
         ${LBUG_SRC_DIR}/src/include
         ${httplib_SOURCE_DIR}
-        ${ZSTD_INCLUDE}
         # Generated headers from ladybug build.
         ${CMAKE_BINARY_DIR}/src/include
         # turbograph VFS headers.
@@ -78,6 +77,12 @@ include_directories(
         ${TURBOGRAPH_ROOT}/extension/include
         # For static linking: generated_extension_loader.h includes "turbograph_extension.h"
         ${TURBOGRAPH_ROOT}/extension/include/main)
+
+if(TURBOGRAPH_USE_LBUG_ZSTD_NAMESPACE)
+    include_directories(BEFORE ${LBUG_SRC_DIR}/third_party/zstd/include)
+else()
+    include_directories(${ZSTD_INCLUDE})
+endif()
 
 # ALP third-party headers (needed by compression.h).
 include_directories(${LBUG_SRC_DIR}/third_party/alp/include)
