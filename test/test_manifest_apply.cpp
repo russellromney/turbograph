@@ -42,6 +42,21 @@ static TieredConfig makeConfig(const std::filesystem::path& dir) {
     return cfg;
 }
 
+static std::string readTextFileIfExists(const std::filesystem::path& path) {
+    if (!std::filesystem::exists(path)) return {};
+    std::ifstream f(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
+static void writeManifestFile(const std::filesystem::path& cacheDir, const Manifest& manifest) {
+    std::filesystem::create_directories(cacheDir);
+    auto manifestPath = cacheDir / "manifest.json";
+    auto json = manifest.toJSON();
+    std::ofstream f(manifestPath, std::ios::binary | std::ios::trunc);
+    f.write(json.data(), json.size());
+}
+
 // --- Test: syncAndGetVersion with no dirty pages returns current version ---
 static void testSyncNoDirtyPages() {
     auto dir = tmpDir("sync_no_dirty");
@@ -328,6 +343,15 @@ static void testApplyManifestMissingPageGroupLeavesStateUnchanged() {
 
     // Sync to local (S3 upload fails but local cache is populated).
     vfs.syncAndGetVersion();
+    auto manifestPath = std::filesystem::path(cfg.cacheDir) / "manifest.json";
+    auto manifestBefore = readTextFileIfExists(manifestPath);
+    auto localFilePath = std::filesystem::path(cfg.cacheDir) / "data.cache";
+    std::vector<uint8_t> pageBefore(PAGE_SIZE);
+    {
+        std::ifstream f(localFilePath, std::ios::binary);
+        f.read(reinterpret_cast<char*>(pageBefore.data()), pageBefore.size());
+        assert(f.gcount() == static_cast<std::streamsize>(pageBefore.size()));
+    }
 
     Manifest remote;
     remote.version = 10;
@@ -346,9 +370,69 @@ static void testApplyManifestMissingPageGroupLeavesStateUnchanged() {
     }
     assert(threw);
     assert(vfs.getManifestVersion() == 0);
+    assert(readTextFileIfExists(manifestPath) == manifestBefore);
+    std::vector<uint8_t> pageAfter(PAGE_SIZE);
+    {
+        std::ifstream f(localFilePath, std::ios::binary);
+        f.read(reinterpret_cast<char*>(pageAfter.data()), pageAfter.size());
+        assert(f.gcount() == static_cast<std::streamsize>(pageAfter.size()));
+    }
+    assert(pageAfter == pageBefore);
 
     std::filesystem::remove_all(dir);
     std::printf("  PASS: testApplyManifestMissingPageGroupLeavesStateUnchanged\n");
+}
+
+// --- Test: incomplete manifest staging files are ignored on restart ---
+static void testIncompleteManifestTmpIgnoredOnOpen() {
+    auto dir = tmpDir("manifest_tmp_ignored");
+    auto cfg = makeConfig(dir);
+    auto cacheDir = std::filesystem::path(cfg.cacheDir);
+
+    Manifest oldManifest;
+    oldManifest.version = 3;
+    oldManifest.pageSize = PAGE_SIZE;
+    oldManifest.pagesPerGroup = PAGES_PER_GROUP;
+    writeManifestFile(cacheDir, oldManifest);
+
+    Manifest stagedManifest = oldManifest;
+    stagedManifest.version = 4;
+    auto stagedJson = stagedManifest.toJSON();
+    {
+        std::ofstream f(cacheDir / "manifest.json.tmp", std::ios::binary | std::ios::trunc);
+        f.write(stagedJson.data(), stagedJson.size());
+    }
+
+    TieredFileSystem vfs(cfg);
+    auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+    assert(vfs.getManifestVersion() == 3);
+    assert(readTextFileIfExists(cacheDir / "manifest.json") == oldManifest.toJSON());
+
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testIncompleteManifestTmpIgnoredOnOpen\n");
+}
+
+// --- Test: deleted local cache sidecars reopen from the durable manifest cleanly ---
+static void testDeletedCacheSidecarsReopenCleanly() {
+    auto dir = tmpDir("deleted_cache_sidecars");
+    auto cfg = makeConfig(dir);
+    auto cacheDir = std::filesystem::path(cfg.cacheDir);
+
+    Manifest manifest;
+    manifest.version = 7;
+    manifest.pageSize = PAGE_SIZE;
+    manifest.pagesPerGroup = PAGES_PER_GROUP;
+    writeManifestFile(cacheDir, manifest);
+    std::filesystem::remove(cacheDir / "data.cache");
+    std::filesystem::remove(cacheDir / "page_bitmap");
+
+    TieredFileSystem vfs(cfg);
+    auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+    assert(vfs.getManifestVersion() == 7);
+    assert(std::filesystem::exists(cacheDir / "data.cache"));
+
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testDeletedCacheSidecarsReopenCleanly\n");
 }
 
 // --- Test: syncAndGetVersion with no active file returns 0 ---
@@ -781,6 +865,8 @@ int main() {
     testApplyManifestNoFile();
     testJournalSeqSetDuringSync();
     testApplyManifestMissingPageGroupLeavesStateUnchanged();
+    testIncompleteManifestTmpIgnoredOnOpen();
+    testDeletedCacheSidecarsReopenCleanly();
     testSyncNoActiveFile();
     testApplyManifestGarbageJSON();
     testConcurrentApplyAndRead();
