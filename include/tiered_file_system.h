@@ -256,6 +256,10 @@ public:
     // Expose S3 client for I/O counters (benchmarking).
     S3Client& s3() { return *s3_; }
 
+    // Token used by extension-side registries to avoid returning freed TFS
+    // pointers after an owning Database/FileSystem is destroyed.
+    std::weak_ptr<void> lifetimeToken() const { return lifetimeToken_; }
+
     // Called by TieredFileInfo destructor to prevent dangling pointer.
     void clearActiveFileInfo(TieredFileInfo* expected) {
         activeFileInfo_.compare_exchange_strong(expected, nullptr);
@@ -367,6 +371,7 @@ private:
 
     TieredConfig config_;
     std::shared_ptr<S3Client> s3_;
+    std::shared_ptr<void> lifetimeToken_ = std::make_shared<int>(0);
     mutable bool existsCached_ = false;
     mutable bool existsResult_ = false;
     mutable std::mutex existsMu_;

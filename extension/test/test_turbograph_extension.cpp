@@ -76,6 +76,61 @@ static void testUDFsRegistered() {
     std::printf("  PASS: testUDFsRegistered\n");
 }
 
+// --- Test: registry does not return a destroyed TFS ---
+static void testTfsRegistryDropsExpiredEntry() {
+    main::SystemConfig sysCfg;
+    main::Database db(":memory:", sysCfg);
+
+    auto ctx = main::ClientContext(&db);
+    turbograph_extension::TurbographExtension::load(&ctx);
+
+    tiered::TieredConfig cfg;
+    cfg.s3 = {"http://dummy", "bucket", "prefix", "auto", "ak", "sk"};
+    cfg.dataFilePath = "/tmp/nonexistent.kz";
+    cfg.cacheDir = "/tmp/turbograph_test_cache";
+    auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
+    auto* rawTfs = tfsPtr.get();
+    turbograph_extension::TurbographExtension::registerTfs(&db, rawTfs);
+
+    assert(turbograph_extension::TurbographExtension::tfsFromBindData(nullptr) == rawTfs);
+
+    tfsPtr.reset();
+    assert(turbograph_extension::TurbographExtension::tfsFromBindData(nullptr) == nullptr);
+    assert(turbograph_extension::TurbographExtension::tfs == nullptr);
+
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
+
+    std::printf("  PASS: testTfsRegistryDropsExpiredEntry\n");
+}
+
+// --- Test: one DB must not inherit another DB's TFS ---
+static void testPerDbRegistryDoesNotFallbackAcrossDatabases() {
+    main::SystemConfig sysCfg;
+    main::Database db1(":memory:", sysCfg);
+    main::Database db2(":memory:", sysCfg);
+
+    auto ctx1 = main::ClientContext(&db1);
+    auto ctx2 = main::ClientContext(&db2);
+    turbograph_extension::TurbographExtension::load(&ctx1);
+    turbograph_extension::TurbographExtension::load(&ctx2);
+
+    tiered::TieredConfig cfg;
+    cfg.s3 = {"http://dummy", "bucket", "prefix", "auto", "ak", "sk"};
+    cfg.dataFilePath = "/tmp/nonexistent.kz";
+    cfg.cacheDir = "/tmp/turbograph_test_cache";
+    auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
+    turbograph_extension::TurbographExtension::registerTfs(&db1, tfsPtr.get());
+
+    main::Connection conn2(&db2);
+    auto val = queryScalar(conn2,
+        "RETURN turbograph_config_get('prefetch') AS v");
+    assert(val == "turbograph not active");
+
+    turbograph_extension::TurbographExtension::registerTfs(&db1, nullptr);
+
+    std::printf("  PASS: testPerDbRegistryDoesNotFallbackAcrossDatabases\n");
+}
+
 // --- Test: config_set with invalid key returns error ---
 static void testConfigSetUnknownKey() {
     main::SystemConfig sysCfg;
@@ -91,7 +146,7 @@ static void testConfigSetUnknownKey() {
     cfg.dataFilePath = "/tmp/nonexistent.kz";
     cfg.cacheDir = "/tmp/turbograph_test_cache";
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
-    turbograph_extension::TurbographExtension::tfs = tfsPtr.get();
+    turbograph_extension::TurbographExtension::registerTfs(&db, tfsPtr.get());
 
     main::Connection conn(&db);
 
@@ -99,8 +154,7 @@ static void testConfigSetUnknownKey() {
         "RETURN turbograph_config_set('nonexistent_key', 'value') AS v");
     assert(val.find("unknown key") != std::string::npos);
 
-    // Cleanup.
-    turbograph_extension::TurbographExtension::tfs = nullptr;
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
 
     std::printf("  PASS: testConfigSetUnknownKey\n");
 }
@@ -118,7 +172,7 @@ static void testConfigSetGetRoundTrip() {
     cfg.dataFilePath = "/tmp/nonexistent.kz";
     cfg.cacheDir = "/tmp/turbograph_test_cache";
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
-    turbograph_extension::TurbographExtension::tfs = tfsPtr.get();
+    turbograph_extension::TurbographExtension::registerTfs(&db, tfsPtr.get());
 
     main::Connection conn(&db);
 
@@ -149,7 +203,7 @@ static void testConfigSetGetRoundTrip() {
     getVal = queryScalar(conn, "RETURN turbograph_config_get('prefetch') AS v");
     assert(getVal == "scan"); // Reset goes to "scan" (graph default).
 
-    turbograph_extension::TurbographExtension::tfs = nullptr;
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
 
     std::printf("  PASS: testConfigSetGetRoundTrip\n");
 }
@@ -167,7 +221,7 @@ static void testConfigSetBadFloat() {
     cfg.dataFilePath = "/tmp/nonexistent.kz";
     cfg.cacheDir = "/tmp/turbograph_test_cache";
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
-    turbograph_extension::TurbographExtension::tfs = tfsPtr.get();
+    turbograph_extension::TurbographExtension::registerTfs(&db, tfsPtr.get());
 
     main::Connection conn(&db);
 
@@ -175,7 +229,7 @@ static void testConfigSetBadFloat() {
         "RETURN turbograph_config_set('prefetch_scan', 'abc,xyz') AS v");
     assert(val.find("error parsing") != std::string::npos);
 
-    turbograph_extension::TurbographExtension::tfs = nullptr;
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
 
     std::printf("  PASS: testConfigSetBadFloat\n");
 }
@@ -193,7 +247,7 @@ static void testConfigGetFetchCounters() {
     cfg.dataFilePath = "/tmp/nonexistent.kz";
     cfg.cacheDir = "/tmp/turbograph_test_cache";
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
-    turbograph_extension::TurbographExtension::tfs = tfsPtr.get();
+    turbograph_extension::TurbographExtension::registerTfs(&db, tfsPtr.get());
 
     main::Connection conn(&db);
 
@@ -205,7 +259,7 @@ static void testConfigGetFetchCounters() {
         "RETURN turbograph_config_get('s3_fetch_bytes') AS v");
     assert(bytes == "0");
 
-    turbograph_extension::TurbographExtension::tfs = nullptr;
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
 
     std::printf("  PASS: testConfigGetFetchCounters\n");
 }
@@ -224,7 +278,7 @@ static void testUDFAffectsTFS() {
     cfg.cacheDir = "/tmp/turbograph_test_cache";
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
     auto* rawTfs = tfsPtr.get();
-    turbograph_extension::TurbographExtension::tfs = rawTfs;
+    turbograph_extension::TurbographExtension::registerTfs(&db, rawTfs);
 
     main::Connection conn(&db);
 
@@ -242,7 +296,7 @@ static void testUDFAffectsTFS() {
     queryScalar(conn, "RETURN turbograph_config_set('prefetch_reset', '') AS v");
     assert(rawTfs->getActiveSchedule() == "scan");
 
-    turbograph_extension::TurbographExtension::tfs = nullptr;
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
 
     std::printf("  PASS: testUDFAffectsTFS\n");
 }
@@ -261,7 +315,7 @@ static void testUDFCustomSchedule() {
     cfg.cacheDir = "/tmp/turbograph_test_cache";
     auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
     auto* rawTfs = tfsPtr.get();
-    turbograph_extension::TurbographExtension::tfs = rawTfs;
+    turbograph_extension::TurbographExtension::registerTfs(&db, rawTfs);
 
     main::Connection conn(&db);
 
@@ -276,7 +330,7 @@ static void testUDFCustomSchedule() {
     queryScalar(conn, "RETURN turbograph_config_set('prefetch_reset', '') AS v");
     assert(rawTfs->getActiveSchedule() == "scan");
 
-    turbograph_extension::TurbographExtension::tfs = nullptr;
+    turbograph_extension::TurbographExtension::registerTfs(&db, nullptr);
 
     std::printf("  PASS: testUDFCustomSchedule\n");
 }
@@ -424,6 +478,8 @@ int main() {
 
     testExtensionLoadsWithoutCredentials();
     testUDFsRegistered();
+    testTfsRegistryDropsExpiredEntry();
+    testPerDbRegistryDoesNotFallbackAcrossDatabases();
     testConfigSetUnknownKey();
     testConfigSetGetRoundTrip();
     testConfigSetBadFloat();
@@ -434,6 +490,6 @@ int main() {
     testBuildTablePageMap();
     testPerTableScheduleSelection();
 
-    std::printf("  All 11 extension tests passed.\n");
+    std::printf("  All 13 extension tests passed.\n");
     return 0;
 }

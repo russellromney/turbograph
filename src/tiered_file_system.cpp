@@ -298,6 +298,8 @@ uint64_t TieredFileSystem::prefetchTables(const std::vector<uint32_t>& tableIds)
 }
 
 TieredFileSystem::~TieredFileSystem() {
+    lifetimeToken_.reset();
+
     // Stop prefetch pool before flushing.
     drainPrefetchAndWait();
     {

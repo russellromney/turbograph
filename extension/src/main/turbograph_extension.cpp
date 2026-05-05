@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace lbug {
 namespace turbograph_extension {
@@ -26,13 +27,42 @@ static std::mutex& registryMutex() {
     return mutex;
 }
 
-static std::unordered_map<main::Database*, tiered::TieredFileSystem*>& tfsRegistry() {
-    static std::unordered_map<main::Database*, tiered::TieredFileSystem*> registry;
+struct RegisteredTfs {
+    tiered::TieredFileSystem* tfs = nullptr;
+    std::weak_ptr<void> lifetime;
+};
+
+static RegisteredTfs makeRegistration(tiered::TieredFileSystem* tfs) {
+    RegisteredTfs registration;
+    registration.tfs = tfs;
+    if (tfs) {
+        registration.lifetime = tfs->lifetimeToken();
+    }
+    return registration;
+}
+
+static tiered::TieredFileSystem* liveTfs(RegisteredTfs& registration) {
+    if (!registration.tfs) return nullptr;
+    if (registration.lifetime.expired()) {
+        registration = {};
+        return nullptr;
+    }
+    return registration.tfs;
+}
+
+static std::unordered_map<main::Database*, RegisteredTfs>& tfsRegistry() {
+    static std::unordered_map<main::Database*, RegisteredTfs> registry;
     return registry;
+}
+
+static RegisteredTfs& fallbackTfsRegistration() {
+    static RegisteredTfs registration;
+    return registration;
 }
 
 struct TurbographBindData final : function::FunctionBindData {
     tiered::TieredFileSystem* tfs = nullptr;
+    std::weak_ptr<void> lifetime;
     main::Database* db = nullptr;
 
     TurbographBindData(const function::ScalarBindFuncInput& input,
@@ -40,25 +70,46 @@ struct TurbographBindData final : function::FunctionBindData {
         : FunctionBindData(common::LogicalType(
               input.definition->ptrCast<function::ScalarOrAggregateFunction>()->returnTypeID)),
           tfs(boundTfs),
-          db(input.context ? input.context->getDatabase() : nullptr) {}
+          db(input.context ? input.context->getDatabase() : nullptr) {
+        if (tfs) lifetime = tfs->lifetimeToken();
+    }
 
     TurbographBindData(std::vector<common::LogicalType> paramTypes,
         common::LogicalType resultType, tiered::TieredFileSystem* boundTfs,
         main::Database* boundDb)
         : FunctionBindData(std::move(paramTypes), std::move(resultType)),
           tfs(boundTfs),
-          db(boundDb) {}
+          db(boundDb) {
+        if (tfs) lifetime = tfs->lifetimeToken();
+    }
 
     std::unique_ptr<function::FunctionBindData> copy() const override {
-        return std::make_unique<TurbographBindData>(
+        auto copied = std::make_unique<TurbographBindData>(
             common::LogicalType::copy(paramTypes), resultType.copy(), tfs, db);
+        copied->lifetime = lifetime;
+        return copied;
     }
 };
 
+static tiered::TieredFileSystem* liveBoundTfs(TurbographBindData& bound) {
+    if (!bound.tfs) return nullptr;
+    if (bound.lifetime.expired()) {
+        bound.tfs = nullptr;
+        return nullptr;
+    }
+    return bound.tfs;
+}
+
 static tiered::TieredFileSystem* registeredTfs(main::Database* database) {
+    if (!database) return nullptr;
     std::lock_guard<std::mutex> guard(registryMutex());
     auto it = tfsRegistry().find(database);
-    return it == tfsRegistry().end() ? nullptr : it->second;
+    if (it == tfsRegistry().end()) return nullptr;
+    auto* tfs = liveTfs(it->second);
+    if (!tfs) {
+        tfsRegistry().erase(it);
+    }
+    return tfs;
 }
 
 static main::ClientContext* contextFromBindData(void* dataPtr) {
@@ -69,17 +120,26 @@ static main::ClientContext* contextFromBindData(void* dataPtr) {
 tiered::TieredFileSystem* TurbographExtension::tfsFromBindData(void* dataPtr) {
     if (auto* bound = dynamic_cast<TurbographBindData*>(
             reinterpret_cast<function::FunctionBindData*>(dataPtr))) {
-        if (bound->tfs) return bound->tfs;
+        if (bound->tfs) return liveBoundTfs(*bound);
     }
 
     auto* context = contextFromBindData(dataPtr);
     auto* database = context ? context->getDatabase() : nullptr;
-    if (!database) return tfs;
+    if (!database) {
+        std::lock_guard<std::mutex> guard(registryMutex());
+        auto* liveFallback = liveTfs(fallbackTfsRegistration());
+        tfs = liveFallback;
+        return liveFallback ? liveFallback : tfs;
+    }
 
     std::lock_guard<std::mutex> guard(registryMutex());
     auto it = tfsRegistry().find(database);
-    if (it != tfsRegistry().end() && it->second) return it->second;
-    return tfs;
+    if (it != tfsRegistry().end()) {
+        auto* registered = liveTfs(it->second);
+        if (registered) return registered;
+        tfsRegistry().erase(it);
+    }
+    return nullptr;
 }
 
 main::Database* TurbographExtension::dbFromBindData(void* dataPtr) {
@@ -97,6 +157,19 @@ std::unique_ptr<function::FunctionBindData> TurbographExtension::bindFunction(
     const function::ScalarBindFuncInput& input) {
     auto* database = input.context ? input.context->getDatabase() : nullptr;
     return std::make_unique<TurbographBindData>(input, registeredTfs(database));
+}
+
+void TurbographExtension::registerTfs(main::Database* database, tiered::TieredFileSystem* activeTfs) {
+    std::lock_guard<std::mutex> guard(registryMutex());
+    if (database) {
+        if (activeTfs) {
+            tfsRegistry()[database] = makeRegistration(activeTfs);
+        } else {
+            tfsRegistry().erase(database);
+        }
+    }
+    fallbackTfsRegistration() = makeRegistration(activeTfs);
+    tfs = activeTfs;
 }
 
 static tiered::TieredConfig configFromExtensionOptions(main::ClientContext* context) {
@@ -264,11 +337,7 @@ void TurbographExtension::load(main::ClientContext* context) {
         activeTfs = tfsPtr.get();
         db->registerFileSystem(std::move(tfsPtr));
     }
-    tfs = activeTfs;
-    {
-        std::lock_guard<std::mutex> guard(registryMutex());
-        tfsRegistry()[db] = activeTfs;
-    }
+    registerTfs(db, activeTfs);
 
     // Store Database pointer for table map builder (UDF manual rebuild path).
     TurbographExtension::db = db;

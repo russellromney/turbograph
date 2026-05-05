@@ -1,6 +1,23 @@
 # Extension tests: build against LadybugDB to test UDF registration + config round-trip.
 # Requires LADYBUG_DIR pointing to a built LadybugDB tree.
 
+cmake_minimum_required(VERSION 3.20)
+project(TurbographExtensionTest LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+enable_testing()
+
+find_package(OpenSSL REQUIRED)
+
+if(NOT DEFINED httplib_SOURCE_DIR)
+    include(FetchContent)
+    FetchContent_Declare(httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+        GIT_TAG v0.18.7
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(httplib)
+endif()
+
 # Homebrew LLVM needs its own libc++ on macOS.
 if(APPLE AND EXISTS "/opt/homebrew/opt/llvm/lib/c++")
     link_directories("/opt/homebrew/opt/llvm/lib/c++")
@@ -61,6 +78,7 @@ target_include_directories(test_turbograph_extension BEFORE PRIVATE
 target_include_directories(test_turbograph_extension PRIVATE
     ${TURBOGRAPH_ROOT}/extension/include
     ${TURBOGRAPH_ROOT}/include
+    ${OPENSSL_INCLUDE_DIR}
     ${httplib_SOURCE_DIR})
 
 # Link all LadybugDB third-party static libraries.
