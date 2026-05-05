@@ -86,7 +86,7 @@ static void testImmutableKeyNaming() {
     std::printf("  PASS: testImmutableKeyNaming\n");
 }
 
-// Phase GraphZenith: journal_seq round-trip
+// Journal sequence round-trip.
 static void testJournalSeqRoundTrip() {
     Manifest m;
     m.version = 10;
@@ -103,7 +103,7 @@ static void testJournalSeqRoundTrip() {
     std::printf("  PASS: testJournalSeqRoundTrip\n");
 }
 
-// Phase GraphZenith: journal_seq defaults to 0 when missing
+// Journal sequence defaults to 0 when missing.
 static void testJournalSeqDefaultsToZero() {
     // JSON without journal_seq field
     std::string json = R"({"version":5,"page_count":50,"page_size":4096,"pages_per_group":2048,"page_group_keys":["pg/0_v5"]})";
@@ -113,7 +113,7 @@ static void testJournalSeqDefaultsToZero() {
     std::printf("  PASS: testJournalSeqDefaultsToZero\n");
 }
 
-// Phase GraphZenith: journal_seq = 0 is omitted from JSON (backward compat)
+// Journal sequence 0 is omitted from JSON for backward compatibility.
 static void testJournalSeqZeroOmitted() {
     Manifest m;
     m.version = 1;
@@ -129,7 +129,7 @@ static void testJournalSeqZeroOmitted() {
     std::printf("  PASS: testJournalSeqZeroOmitted\n");
 }
 
-// Phase GraphZenith: journal_seq > 0 appears in JSON
+// Non-zero journal sequence appears in JSON.
 static void testJournalSeqNonZeroPresent() {
     Manifest m;
     m.version = 1;
@@ -148,7 +148,7 @@ static void testJournalSeqNonZeroPresent() {
     std::printf("  PASS: testJournalSeqNonZeroPresent\n");
 }
 
-// Phase GraphZenith: large journal_seq values
+// Large journal sequence values.
 static void testJournalSeqLargeValue() {
     Manifest m;
     m.version = 1;
@@ -165,7 +165,7 @@ static void testJournalSeqLargeValue() {
     std::printf("  PASS: testJournalSeqLargeValue\n");
 }
 
-// Phase GraphTurbogenesis: msgpack pure manifest round-trip
+// Msgpack pure manifest round-trip.
 static void testMsgpackRoundTrip() {
     Manifest m;
     m.version = 42;
@@ -197,7 +197,7 @@ static void testMsgpackRoundTrip() {
     std::printf("  PASS: testMsgpackRoundTrip\n");
 }
 
-// Phase GraphTurbogenesis: msgpack hybrid payload round-trip
+// Msgpack hybrid payload round-trip.
 static void testHybridPayloadRoundTrip() {
     Manifest m;
     m.version = 7;
@@ -222,7 +222,7 @@ static void testHybridPayloadRoundTrip() {
     std::printf("  PASS: testHybridPayloadRoundTrip\n");
 }
 
-// Phase GraphTurbogenesis: msgpack subframe overrides survive round-trip
+// Msgpack subframe overrides survive round-trip.
 static void testMsgpackSubframeOverrides() {
     Manifest m;
     m.version = 5;
@@ -245,7 +245,7 @@ static void testMsgpackSubframeOverrides() {
     std::printf("  PASS: testMsgpackSubframeOverrides\n");
 }
 
-// Phase GraphTurbogenesis: wire tag byte round-trip through TieredFileSystem shape
+// Wire tag byte round-trip through TieredFileSystem shape.
 static void testWireTagDiscrimination() {
     // Pure manifest bytes should start with 0x01
     Manifest m;
@@ -263,7 +263,7 @@ static void testWireTagDiscrimination() {
     std::printf("  PASS: testWireTagDiscrimination\n");
 }
 
-// Phase GraphTurbogenesis: malformed msgpack — truncated input should return nullopt
+// Malformed msgpack: truncated input should return nullopt.
 static void testMalformedMsgpackTruncated() {
     // A valid msgpack fixmap header for 10 fields, but truncated before any content.
     std::vector<uint8_t> bad = {0x8A};
@@ -272,7 +272,7 @@ static void testMalformedMsgpackTruncated() {
     std::printf("  PASS: testMalformedMsgpackTruncated\n");
 }
 
-// Phase GraphTurbogenesis: malformed msgpack — wrong type tag should return nullopt
+// Malformed msgpack: wrong type tag should return nullopt.
 static void testMalformedMsgpackWrongTypeTag() {
     // A valid msgpack array header (0x91 = fixarray 1) followed by a string,
     // but the decoder expects a map.

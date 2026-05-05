@@ -8,7 +8,7 @@ namespace lbug {
 namespace tiered {
 
 // ============================================================================
-// Minimal msgpack encoder/decoder (Phase GraphTurbogenesis)
+// Minimal msgpack encoder/decoder
 // ============================================================================
 // Self-contained implementation to avoid adding a dependency. Produces
 // msgpack maps with string keys, compatible with rmp_serde for
@@ -454,7 +454,7 @@ std::string Manifest::toJSON() const {
         json += ']';
     }
 
-    // Phase GraphDrift: subframe overrides (omitted when empty for backward compat).
+    // Subframe overrides are omitted when empty for backward compatibility.
     if (!subframeOverrides.empty()) {
         bool hasAny = false;
         for (auto& ovMap : subframeOverrides) {
@@ -496,7 +496,7 @@ std::string Manifest::toJSON() const {
         json += ",\"encrypted\":true";
     }
 
-    // Phase GraphZenith: journal_seq (omitted when 0 for backward compat).
+    // journal_seq is omitted when 0 for backward compatibility.
     if (journalSeq > 0) {
         json += ",\"journal_seq\":";
         json += std::to_string(journalSeq);
@@ -750,7 +750,7 @@ std::optional<Manifest> Manifest::fromJSON(const std::string& json) {
         }
     }
 
-    // Phase GraphDrift: optional subframe overrides (backward compat: missing = empty).
+    // Optional subframe overrides. Missing means empty for backward compatibility.
     auto ovs = parseSubframeOverrides(json);
     if (ovs.has_value()) {
         m.subframeOverrides = std::move(*ovs);
@@ -760,14 +760,14 @@ std::optional<Manifest> Manifest::fromJSON(const std::string& json) {
     // Optional encrypted flag (backward compat: missing = false).
     m.encrypted = json.find("\"encrypted\":true") != std::string::npos;
 
-    // Phase GraphZenith: optional journal_seq (backward compat: missing = 0).
+    // Optional journal_seq. Missing means 0 for backward compatibility.
     findU64(json, "\"journal_seq\"", m.journalSeq);
 
     return m;
 }
 
 // ============================================================================
-// Phase GraphTurbogenesis: msgpack wire serialization
+// Msgpack wire serialization
 // ============================================================================
 
 std::vector<uint8_t> Manifest::toMsgpack() const {

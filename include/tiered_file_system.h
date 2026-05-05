@@ -55,17 +55,17 @@ struct TieredConfig {
     // Cache eviction. 0 = unlimited (default).
     uint64_t maxCacheBytes = 0;
 
-    // Phase GraphDrift: subframe override threshold.
+    // Subframe override threshold.
     // If dirty frame count in a group < threshold, upload only dirty frames.
     // 0 = auto (framesPerGroup / 4, i.e. 25% of frames).
     uint32_t overrideThreshold = 0;
 
-    // Phase GraphDrift: compaction threshold.
+    // Subframe override compaction threshold.
     // When a group accumulates >= this many overrides, compact back into base.
     // 0 = disabled.
     uint32_t compactionThreshold = 8;
 
-    // Phase GraphZenith: journal sequence set by hakuzu before sync.
+    // Journal sequence set by hakuzu before sync.
     // Written into the manifest so followers know where to replay from.
     uint64_t journalSeq = 0;
 
@@ -74,6 +74,13 @@ struct TieredConfig {
     // CTR mode for local cache (deterministic, page_num as IV).
     // GCM mode for S3 frames (random nonce, authenticated).
     std::optional<std::array<uint8_t, 32>> encryptionKey;
+};
+
+struct DecodedManifestBytes {
+    Manifest manifest;
+    bool hybrid = false;
+    uint64_t graphstreamJournalSeq = 0;
+    std::string graphstreamSegmentPrefix;
 };
 
 // Per-page-group fetch state for async prefetch coordination.
@@ -125,7 +132,7 @@ struct TieredFileInfo : public common::FileInfo {
     enum class TrackMode : uint8_t { NONE, STRUCTURAL, INDEX } trackMode = TrackMode::NONE;
 
     // Pending page groups that need background upload.
-    // Phase GraphDrift: maps group ID to set of dirty local page indices within group.
+    // Maps group ID to set of dirty local page indices within group.
     // This allows override detection: if few frames are dirty, upload only those.
     mutable std::mutex pendingMu;
     std::unordered_set<uint64_t> pendingPageGroups;
@@ -195,7 +202,7 @@ public:
     bool hasTablePageMap() const;
 
     // Proactively prefetch all page groups belonging to the given table IDs.
-    // Used by Phase Cypher to warm tables before query execution.
+    // Used to warm tables before query execution.
     // Returns the number of page groups submitted to the prefetch pool.
     uint64_t prefetchTables(const std::vector<uint32_t>& tableIds);
 
@@ -204,10 +211,10 @@ public:
     using MetadataParserFn = std::function<std::unique_ptr<TablePageMap>(
         const uint8_t* data, size_t len)>;
 
-    // Register the metadata parser. Runs in openFile() after Beacon.
+    // Register the metadata parser. Runs in openFile() after structural-page fetch.
     void setMetadataParser(MetadataParserFn fn);
 
-    // --- Phase GraphZenith: hakuzu integration ---
+    // --- hakuzu integration ---
 
     // Trigger doSyncFile and return the new manifest version.
     // Returns 0 if no active file or no dirty pages.
@@ -216,7 +223,7 @@ public:
     // Return the current manifest version without syncing.
     uint64_t getManifestVersion() const;
 
-    // Phase GraphBridge: return the current manifest as a JSON string.
+    // Return the current manifest as a JSON string.
     // Does not sync. Returns the last-synced manifest state.
     std::string getManifestJSON() const;
 
@@ -225,7 +232,7 @@ public:
     // sets the new manifest as active. Returns the new version.
     uint64_t applyRemoteManifest(const std::string& jsonStr);
 
-    // Phase GraphTurbogenesis: wire methods for opaque-payload envelope.
+    // Wire methods for opaque-payload manifest envelopes.
 
     // Serialize the current manifest to msgpack wire bytes (tag 0x01).
     std::vector<uint8_t> manifestBytes() const;
@@ -237,6 +244,14 @@ public:
     // Decode wire bytes (pure or hybrid) and apply the manifest.
     // Returns hybrid fields if present: (journal_seq, segment_prefix).
     std::pair<uint64_t, std::string> setManifestBytes(const std::vector<uint8_t>& bytes);
+
+    // Decode opaque manifest bytes without touching active file/cache state.
+    DecodedManifestBytes decodeManifestBytes(const std::vector<uint8_t>& bytes) const;
+
+    // Decode and verify every referenced remote object exists before adopt.
+    // Returns hybrid fields if present: (journal_seq, segment_prefix).
+    std::pair<uint64_t, std::string> preflightManifestBytes(
+        const std::vector<uint8_t>& bytes) const;
 
     // Expose S3 client for I/O counters (benchmarking).
     S3Client& s3() { return *s3_; }
@@ -328,6 +343,10 @@ private:
     bool fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroupId,
         uint32_t frameIdx, std::vector<uint8_t>* requestedPageOut = nullptr,
         uint32_t requestedLocalIdx = 0) const;
+
+    // Verify every object referenced by a candidate manifest is readable before
+    // the live cache adopts it.
+    bool manifestObjectsAvailable(const Manifest& manifest) const;
 
     // Background prefetch pool.
     struct PrefetchJob {

@@ -281,11 +281,11 @@ static void testUDFCustomSchedule() {
     std::printf("  PASS: testUDFCustomSchedule\n");
 }
 
-// --- Phase Cypher: extractTablesFromPlan returns correct table IDs ---
+// --- Test: extractTablesFromPlan returns correct table IDs ---
 static void testExtractTablesFromPlan() {
     // Create a database with a node table and a relationship table.
     main::SystemConfig sysCfg;
-    auto tmpDir = std::string("/tmp/turbograph_test_plan_") + std::to_string(getpid());
+    auto tmpDir = std::string("/tmp/turbograph_test_query_prefetch_") + std::to_string(getpid());
     main::Database db(tmpDir, sysCfg);
 
     auto ctx = main::ClientContext(&db);
@@ -347,7 +347,7 @@ static void testExtractTablesFromPlan() {
     std::printf("  PASS: testExtractTablesFromPlan\n");
 }
 
-// --- Phase Volley: buildTablePageMap produces valid mapping ---
+// --- Test: buildTablePageMap produces valid mapping ---
 static void testBuildTablePageMap() {
     // Create a database with tables and data to exercise metadata parsing.
     main::SystemConfig sysCfg;
@@ -390,7 +390,7 @@ static void testBuildTablePageMap() {
     std::printf("  PASS: testBuildTablePageMap\n");
 }
 
-// --- Phase Volley: per-table schedule selection via TablePageMap ---
+// --- Test: per-table schedule selection via TablePageMap ---
 static void testPerTableScheduleSelection() {
     // Verify that TablePageMap lookups correctly identify node vs rel tables.
     // The 24 unit tests in test_table_page_map.cpp cover the data structure

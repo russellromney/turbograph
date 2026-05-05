@@ -3,10 +3,10 @@ mod vfs_smoke {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn sync_manifest_bytes_roundtrip() {
-        // This test requires LBUG_STATIC_EXTENSIONS=turbograph and TURBOGRAPH_DIR.
-        // It is gated behind the extension-tests feature so cargo check works
-        // without a ladybug source tree present.
+    async fn udf_calls_fail_clearly_without_extension() {
+        // The Rust handle is intentionally thin: if the turbograph extension is
+        // not loaded into Ladybug, every UDF-backed operation must fail clearly
+        // instead of silently pretending the VFS has an empty manifest.
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Arc::new(
             lbug::Database::new(
@@ -17,7 +17,6 @@ mod vfs_smoke {
         );
         let vfs = turbograph::TurbographVfs::new(db);
 
-        // Without the extension loaded, sync returns an error (UDF not found).
         let result = vfs.sync().await;
         assert!(
             result.is_err(),
@@ -25,21 +24,20 @@ mod vfs_smoke {
             result
         );
 
-        // manifest_bytes returns NULL -> None when no manifest exists.
         let result = vfs.manifest_bytes().await;
         assert!(
-            result.is_ok() && result.unwrap().is_none(),
-            "manifest_bytes should return None without extension or manifest"
+            result.is_err(),
+            "manifest_bytes should fail without turbograph extension: {:?}",
+            result
         );
 
-        // manifest_version returns NULL -> None when no manifest exists.
         let result = vfs.manifest_version().await;
         assert!(
-            result.is_ok() && result.unwrap().is_none(),
-            "manifest_version should return None without extension or manifest"
+            result.is_err(),
+            "manifest_version should fail without turbograph extension: {:?}",
+            result
         );
 
-        // set_manifest_bytes returns an error on NULL.
         let result = vfs.set_manifest_bytes(&[0x01, 0x02, 0x03]).await;
         assert!(
             result.is_err(),

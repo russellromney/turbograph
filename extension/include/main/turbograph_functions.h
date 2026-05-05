@@ -38,42 +38,42 @@ struct TurbographConfigGetFunction {
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphZenith: turbograph_sync() -> INT64
+// turbograph_sync() -> INT64
 // Triggers doSyncFile and returns the new manifest version.
 struct TurbographSyncFunction {
     static constexpr const char* name = "turbograph_sync";
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphZenith: turbograph_get_manifest_version() -> INT64
+// turbograph_get_manifest_version() -> INT64
 // Returns the current manifest version without syncing.
 struct TurbographGetManifestVersionFunction {
     static constexpr const char* name = "turbograph_get_manifest_version";
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphZenith: turbograph_set_manifest(json STRING) -> INT64
+// turbograph_set_manifest(json STRING) -> INT64
 // Follower applies a remote manifest. Returns the new version.
 struct TurbographSetManifestFunction {
     static constexpr const char* name = "turbograph_set_manifest";
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphBridge: turbograph_get_manifest() -> STRING
+// turbograph_get_manifest() -> STRING
 // Returns the current manifest as a JSON string. Does not sync.
 struct TurbographGetManifestFunction {
     static constexpr const char* name = "turbograph_get_manifest";
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphTurbogenesis: turbograph_manifest_bytes() -> BLOB
+// turbograph_manifest_bytes() -> BLOB
 // Returns the current manifest as msgpack wire bytes (tag 0x01).
 struct TurbographManifestBytesFunction {
     static constexpr const char* name = "turbograph_manifest_bytes";
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphTurbogenesis: turbograph_manifest_bytes_with_graphstream_delta(
+// turbograph_manifest_bytes_with_graphstream_delta(
 //   journal_seq INT64, segment_prefix STRING) -> BLOB
 // Returns hybrid manifest + graphstream delta as msgpack wire bytes (tag 0x02).
 struct TurbographManifestBytesWithGraphstreamDeltaFunction {
@@ -81,14 +81,14 @@ struct TurbographManifestBytesWithGraphstreamDeltaFunction {
     static function::function_set getFunctionSet();
 };
 
-// Phase GraphTurbogenesis: turbograph_set_manifest_bytes(bytes BLOB) -> INT64
+// turbograph_set_manifest_bytes(bytes BLOB) -> INT64
 // Follower applies a remote manifest from wire bytes. Returns the new version.
 struct TurbographSetManifestBytesFunction {
     static constexpr const char* name = "turbograph_set_manifest_bytes";
     static function::function_set getFunctionSet();
 };
 
-// Phase Cypher: extract table IDs from a Cypher query's logical plan.
+// Extract table IDs from a Cypher query's logical plan.
 // Returns (nodeTableIds, relTableIds). Does not execute the query.
 std::pair<std::unordered_set<common::table_id_t>, std::unordered_set<common::table_id_t>>
 extractTablesFromPlan(main::Connection& conn, const std::string& cypher);

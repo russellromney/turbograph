@@ -1,4 +1,4 @@
-// Phase GraphZenith: UDFs for hakuzu integration.
+// UDFs for hakuzu integration.
 // turbograph_sync(), turbograph_get_manifest_version(), turbograph_set_manifest(json).
 
 #include "main/turbograph_functions.h"
@@ -19,8 +19,8 @@ using namespace common;
 
 static void syncExec(const std::vector<std::shared_ptr<ValueVector>>& /*parameters*/,
     const std::vector<SelectionVector*>& /*parameterSelVectors*/, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto resultPos = (*resultSelVector)[i];
@@ -42,8 +42,10 @@ static void syncExec(const std::vector<std::shared_ptr<ValueVector>>& /*paramete
 
 function_set TurbographSyncFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
-        std::vector<LogicalTypeID>{}, LogicalTypeID::INT64, syncExec));
+    auto fn = std::make_unique<ScalarFunction>(name,
+        std::vector<LogicalTypeID>{}, LogicalTypeID::INT64, syncExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
@@ -51,8 +53,8 @@ function_set TurbographSyncFunction::getFunctionSet() {
 
 static void getVersionExec(const std::vector<std::shared_ptr<ValueVector>>& /*parameters*/,
     const std::vector<SelectionVector*>& /*parameterSelVectors*/, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto resultPos = (*resultSelVector)[i];
@@ -74,17 +76,19 @@ static void getVersionExec(const std::vector<std::shared_ptr<ValueVector>>& /*pa
 
 function_set TurbographGetManifestVersionFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
-        std::vector<LogicalTypeID>{}, LogicalTypeID::INT64, getVersionExec));
+    auto fn = std::make_unique<ScalarFunction>(name,
+        std::vector<LogicalTypeID>{}, LogicalTypeID::INT64, getVersionExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
-// --- turbograph_get_manifest() -> STRING (Phase GraphBridge) ---
+// --- turbograph_get_manifest() -> STRING ---
 
 static void getManifestExec(const std::vector<std::shared_ptr<ValueVector>>& /*parameters*/,
     const std::vector<SelectionVector*>& /*parameterSelVectors*/, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto resultPos = (*resultSelVector)[i];
@@ -106,8 +110,10 @@ static void getManifestExec(const std::vector<std::shared_ptr<ValueVector>>& /*p
 
 function_set TurbographGetManifestFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
-        std::vector<LogicalTypeID>{}, LogicalTypeID::STRING, getManifestExec));
+    auto fn = std::make_unique<ScalarFunction>(name,
+        std::vector<LogicalTypeID>{}, LogicalTypeID::STRING, getManifestExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
@@ -115,8 +121,8 @@ function_set TurbographGetManifestFunction::getFunctionSet() {
 
 static void setManifestExec(const std::vector<std::shared_ptr<ValueVector>>& parameters,
     const std::vector<SelectionVector*>& parameterSelVectors, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto jsonPos = (*parameterSelVectors[0])[i];
@@ -141,9 +147,11 @@ static void setManifestExec(const std::vector<std::shared_ptr<ValueVector>>& par
 
 function_set TurbographSetManifestFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
+    auto fn = std::make_unique<ScalarFunction>(name,
         std::vector<LogicalTypeID>{LogicalTypeID::STRING},
-        LogicalTypeID::INT64, setManifestExec));
+        LogicalTypeID::INT64, setManifestExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
@@ -151,8 +159,8 @@ function_set TurbographSetManifestFunction::getFunctionSet() {
 
 static void manifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>& /*parameters*/,
     const std::vector<SelectionVector*>& /*parameterSelVectors*/, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto resultPos = (*resultSelVector)[i];
@@ -168,7 +176,7 @@ static void manifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>& /
             StringVector::addString(&result, resultPos,
                 reinterpret_cast<const char*>(bytes.data()), bytes.size());
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "turbograph_zenith: manifestBytes failed: %s\n", e.what());
+            std::fprintf(stderr, "turbograph_manifest: manifestBytes failed: %s\n", e.what());
             result.setNull(resultPos, true);
         }
     }
@@ -176,8 +184,10 @@ static void manifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>& /
 
 function_set TurbographManifestBytesFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
-        std::vector<LogicalTypeID>{}, LogicalTypeID::BLOB, manifestBytesExec));
+    auto fn = std::make_unique<ScalarFunction>(name,
+        std::vector<LogicalTypeID>{}, LogicalTypeID::BLOB, manifestBytesExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
@@ -185,8 +195,8 @@ function_set TurbographManifestBytesFunction::getFunctionSet() {
 
 static void manifestBytesHybridExec(const std::vector<std::shared_ptr<ValueVector>>& parameters,
     const std::vector<SelectionVector*>& parameterSelVectors, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto seqPos = (*parameterSelVectors[0])[i];
@@ -208,7 +218,7 @@ static void manifestBytesHybridExec(const std::vector<std::shared_ptr<ValueVecto
             StringVector::addString(&result, resultPos,
                 reinterpret_cast<const char*>(bytes.data()), bytes.size());
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "turbograph_zenith: manifestBytesWithGraphstreamDelta failed: %s\n", e.what());
+            std::fprintf(stderr, "turbograph_manifest: manifestBytesWithGraphstreamDelta failed: %s\n", e.what());
             result.setNull(resultPos, true);
         }
     }
@@ -216,9 +226,11 @@ static void manifestBytesHybridExec(const std::vector<std::shared_ptr<ValueVecto
 
 function_set TurbographManifestBytesWithGraphstreamDeltaFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
+    auto fn = std::make_unique<ScalarFunction>(name,
         std::vector<LogicalTypeID>{LogicalTypeID::INT64, LogicalTypeID::STRING},
-        LogicalTypeID::BLOB, manifestBytesHybridExec));
+        LogicalTypeID::BLOB, manifestBytesHybridExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
@@ -226,8 +238,8 @@ function_set TurbographManifestBytesWithGraphstreamDeltaFunction::getFunctionSet
 
 static void setManifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>& parameters,
     const std::vector<SelectionVector*>& parameterSelVectors, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
-    auto* tfs = TurbographExtension::tfs;
+    SelectionVector* resultSelVector, void* dataPtr) {
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto bytesPos = (*parameterSelVectors[0])[i];
@@ -245,14 +257,14 @@ static void setManifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>
 
         try {
             auto result_pair = tfs->setManifestBytes(bytes);
-            // TODO(Phase GraphBackend follow-up): UDF returns only result_pair.first (journal_seq).
+            // TODO: UDF returns only result_pair.first (journal_seq).
             // The second field (segment_prefix) is silently dropped. If Shared mode ever
             // needs the prefix after a hybrid apply, change return type to STRUCT or add
             // a separate UDF.
             result.setNull(resultPos, false);
             result.setValue(resultPos, static_cast<int64_t>(result_pair.first));
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "turbograph_zenith: setManifestBytes failed: %s\n", e.what());
+            std::fprintf(stderr, "turbograph_manifest: setManifestBytes failed: %s\n", e.what());
             result.setNull(resultPos, true);
         }
     }
@@ -260,9 +272,11 @@ static void setManifestBytesExec(const std::vector<std::shared_ptr<ValueVector>>
 
 function_set TurbographSetManifestBytesFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
+    auto fn = std::make_unique<ScalarFunction>(name,
         std::vector<LogicalTypeID>{LogicalTypeID::BLOB},
-        LogicalTypeID::INT64, setManifestBytesExec));
+        LogicalTypeID::INT64, setManifestBytesExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 

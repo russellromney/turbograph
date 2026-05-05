@@ -1,4 +1,4 @@
-// Phase GraphZenith tests: journal_seq in manifest, syncAndGetVersion,
+// Manifest sync/apply tests: journal_seq in manifest, syncAndGetVersion,
 // getManifestVersion, applyRemoteManifest, cache validation on open.
 //
 // Uses dummy S3 credentials (uploads will fail). Tests focus on local-path
@@ -24,7 +24,7 @@ static constexpr uint32_t PAGES_PER_GROUP = 4;
 
 static std::filesystem::path tmpDir(const char* suffix) {
     auto dir = std::filesystem::temp_directory_path() /
-        (std::string("tiered_zenith_test_") + suffix);
+        (std::string("tiered_manifest_apply_test_") + suffix);
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     return dir;
@@ -32,7 +32,7 @@ static std::filesystem::path tmpDir(const char* suffix) {
 
 static TieredConfig makeConfig(const std::filesystem::path& dir) {
     TieredConfig cfg;
-    cfg.s3 = {"https://localhost:1", "fake-bucket", "test/zenith", "auto",
+    cfg.s3 = {"https://localhost:1", "fake-bucket", "test/manifest_apply", "auto",
               "fake-ak", "fake-sk", 1};
     cfg.cacheDir = (dir / "cache").string();
     cfg.dataFilePath = (dir / "data.kz").string();
@@ -136,6 +136,29 @@ static void testApplyManifestSameVersion() {
     std::printf("  PASS: testApplyManifestSameVersion\n");
 }
 
+// --- Test: same-version apply is a local no-op, even if remote objects are gone ---
+static void testApplyManifestNoopSkipsRemotePreflight() {
+    auto dir = tmpDir("apply_noop_skip_preflight");
+    auto cfg = makeConfig(dir);
+    TieredFileSystem vfs(cfg);
+
+    auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+
+    Manifest remote;
+    remote.version = 0;
+    remote.pageCount = PAGES_PER_GROUP;
+    remote.pageSize = PAGE_SIZE;
+    remote.pagesPerGroup = PAGES_PER_GROUP;
+    remote.pageGroupKeys = {"pg/missing_v0"};
+
+    auto version = vfs.applyRemoteManifest(remote.toJSON());
+    assert(version == 0);
+    assert(vfs.getManifestVersion() == 0);
+
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testApplyManifestNoopSkipsRemotePreflight\n");
+}
+
 // --- Test: applyRemoteManifest with newer version updates manifest ---
 static void testApplyManifestNewerVersion() {
     auto dir = tmpDir("apply_newer");
@@ -147,10 +170,9 @@ static void testApplyManifestNewerVersion() {
     // Build a "remote" manifest with higher version.
     Manifest remote;
     remote.version = 5;
-    remote.pageCount = 8; // 2 page groups with PAGES_PER_GROUP=4.
+    remote.pageCount = 0;
     remote.pageSize = PAGE_SIZE;
     remote.pagesPerGroup = PAGES_PER_GROUP;
-    remote.pageGroupKeys = {"pg/0_v5", "pg/1_v5"};
     remote.journalSeq = 100;
     auto json = remote.toJSON();
 
@@ -250,7 +272,7 @@ static void testApplyManifestNoFile() {
 }
 
 // --- Test: journal_seq is set in manifest after sync ---
-// Phase Laika: with S3Primary ordering fix, the local manifest is only
+// With S3Primary ordering, the local manifest is only
 // persisted after a successful S3 upload. With fake S3 (uploads fail),
 // the local manifest file will not be updated with journalSeq. The
 // in-memory manifest still gets the stamp. This test verifies the
@@ -290,9 +312,9 @@ static void testJournalSeqSetDuringSync() {
     std::printf("  PASS: testJournalSeqSetDuringSync\n");
 }
 
-// --- Test: applyRemoteManifest invalidates cache for changed groups ---
-static void testApplyManifestInvalidatesChangedGroups() {
-    auto dir = tmpDir("apply_invalidate");
+// --- Test: applyRemoteManifest preflights missing page groups before mutation ---
+static void testApplyManifestMissingPageGroupLeavesStateUnchanged() {
+    auto dir = tmpDir("apply_missing_group");
     auto cfg = makeConfig(dir);
     TieredFileSystem vfs(cfg);
 
@@ -307,7 +329,6 @@ static void testApplyManifestInvalidatesChangedGroups() {
     // Sync to local (S3 upload fails but local cache is populated).
     vfs.syncAndGetVersion();
 
-    // Now apply a remote manifest that changes group 0's key.
     Manifest remote;
     remote.version = 10;
     remote.pageCount = PAGES_PER_GROUP;
@@ -316,15 +337,18 @@ static void testApplyManifestInvalidatesChangedGroups() {
     remote.pageGroupKeys = {"pg/0_v10"}; // Different from whatever was set.
     remote.journalSeq = 200;
 
-    auto version = vfs.applyRemoteManifest(remote.toJSON());
-    assert(version == 10);
-
-    // The cache for group 0 should be invalidated.
-    // We can verify by checking the manifest version is updated.
-    assert(vfs.getManifestVersion() == 10);
+    bool threw = false;
+    try {
+        vfs.applyRemoteManifest(remote.toJSON());
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+    assert(threw);
+    assert(vfs.getManifestVersion() == 0);
 
     std::filesystem::remove_all(dir);
-    std::printf("  PASS: testApplyManifestInvalidatesChangedGroups\n");
+    std::printf("  PASS: testApplyManifestMissingPageGroupLeavesStateUnchanged\n");
 }
 
 // --- Test: syncAndGetVersion with no active file returns 0 ---
@@ -438,57 +462,70 @@ static void testConcurrentApplyAndRead() {
     std::printf("  PASS: testConcurrentApplyAndRead\n");
 }
 
-// --- Test: override content invalidation (same key, different offset/len) ---
-static void testOverrideContentInvalidation() {
-    auto dir = tmpDir("override_content");
+// --- Test: applyRemoteManifest preflights missing subframe overrides before mutation ---
+static void testApplyManifestMissingOverrideLeavesStateUnchanged() {
+    auto dir = tmpDir("missing_override");
     auto cfg = makeConfig(dir);
     TieredFileSystem vfs(cfg);
 
     auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
 
-    // Apply first manifest with override on group 0, frame 0.
-    Manifest m1;
-    m1.version = 1;
-    m1.pageCount = PAGES_PER_GROUP;
-    m1.pageSize = PAGE_SIZE;
-    m1.pagesPerGroup = PAGES_PER_GROUP;
-    m1.pageGroupKeys = {"pg/0_v1"};
-    m1.subframeOverrides.resize(1);
-    SubframeOverride ov1;
-    ov1.key = "pg/0_f0_v1";
-    ov1.entry.offset = 0;
-    ov1.entry.len = 1000;
-    ov1.entry.pageCount = 4;
-    m1.subframeOverrides[0][0] = ov1;
+    Manifest remote;
+    remote.version = 2;
+    remote.pageCount = PAGES_PER_GROUP;
+    remote.pageSize = PAGE_SIZE;
+    remote.pagesPerGroup = PAGES_PER_GROUP;
+    remote.pageGroupKeys = {""}; // Empty base key is ignored; override object is load-bearing.
+    remote.subframeOverrides.resize(1);
+    SubframeOverride overrideFrame;
+    overrideFrame.key = "pg/0_f0_v2";
+    overrideFrame.entry.offset = 0;
+    overrideFrame.entry.len = 2000;
+    overrideFrame.entry.pageCount = 4;
+    remote.subframeOverrides[0][0] = overrideFrame;
 
-    auto v1 = vfs.applyRemoteManifest(m1.toJSON());
-    assert(v1 == 1);
-
-    // Apply second manifest: same override key, but different offset and len.
-    // This simulates a re-upload of the same frame with different content.
-    Manifest m2;
-    m2.version = 2;
-    m2.pageCount = PAGES_PER_GROUP;
-    m2.pageSize = PAGE_SIZE;
-    m2.pagesPerGroup = PAGES_PER_GROUP;
-    m2.pageGroupKeys = {"pg/0_v1"}; // Same base key.
-    m2.subframeOverrides.resize(1);
-    SubframeOverride ov2;
-    ov2.key = "pg/0_f0_v1"; // Same override key.
-    ov2.entry.offset = 0;
-    ov2.entry.len = 2000;   // Different len (content changed).
-    ov2.entry.pageCount = 4;
-    m2.subframeOverrides[0][0] = ov2;
-
-    auto v2 = vfs.applyRemoteManifest(m2.toJSON());
-    assert(v2 == 2);
-
-    // Verify the manifest version is updated, confirming cache was invalidated
-    // for the group with changed override content.
-    assert(vfs.getManifestVersion() == 2);
+    bool threw = false;
+    try {
+        vfs.applyRemoteManifest(remote.toJSON());
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+    assert(threw);
+    assert(vfs.getManifestVersion() == 0);
 
     std::filesystem::remove_all(dir);
-    std::printf("  PASS: testOverrideContentInvalidation\n");
+    std::printf("  PASS: testApplyManifestMissingOverrideLeavesStateUnchanged\n");
+}
+
+// --- Test: seekable manifests must cover required frames before mutation ---
+static void testApplyManifestRejectsUnreadableSeekableShape() {
+    auto dir = tmpDir("bad_seekable_shape");
+    auto cfg = makeConfig(dir);
+    TieredFileSystem vfs(cfg);
+
+    auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+
+    Manifest remote;
+    remote.version = 3;
+    remote.pageCount = PAGES_PER_GROUP;
+    remote.pageSize = PAGE_SIZE;
+    remote.pagesPerGroup = PAGES_PER_GROUP;
+    remote.pageGroupKeys = {""};
+    remote.subPagesPerFrame = 2;
+
+    bool threw = false;
+    try {
+        vfs.applyRemoteManifest(remote.toJSON());
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+    assert(threw);
+    assert(vfs.getManifestVersion() == 0);
+
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testApplyManifestRejectsUnreadableSeekableShape\n");
 }
 
 // --- Test: pageSize mismatch in applyRemoteManifest throws ---
@@ -522,7 +559,7 @@ static void testApplyManifestPageSizeMismatch() {
 }
 
 // --- Test: RPO=0 crash recovery (write, sync, kill, restore) ---
-// Phase Laika: with S3Primary ordering fix, the local manifest is only
+// With S3Primary ordering, the local manifest is only
 // persisted AFTER a successful S3 upload. With fake S3 (uploads fail),
 // flushPendingPageGroups returns early without persisting any manifest.
 // The local cache file still has the data (written by doSyncFile), but
@@ -587,7 +624,7 @@ static void testRPO0CrashRecovery() {
 }
 
 // --- Test: S3 unreachable fallback on open ---
-// Phase Laika: with S3Primary ordering fix, sync with fake S3 does not
+// With S3Primary ordering, sync with fake S3 does not
 // persist the manifest locally (flushPendingPageGroups returns early).
 // But the local cache file still has data, and reopening falls back to
 // the local manifest (from openFile's initial creation).
@@ -618,7 +655,7 @@ static void testS3UnreachableFallbackOnOpen() {
     // Session 2: reopen with unreachable S3.
     {
         auto cfg2 = makeConfig(dir);
-        cfg2.s3 = {"https://localhost:1", "fake-bucket", "test/zenith", "auto",
+        cfg2.s3 = {"https://localhost:1", "fake-bucket", "test/manifest_apply", "auto",
                     "fake-ak", "fake-sk", 1};
 
         TieredFileSystem vfs2(cfg2);
@@ -635,7 +672,7 @@ static void testS3UnreachableFallbackOnOpen() {
     std::printf("  PASS: testS3UnreachableFallbackOnOpen\n");
 }
 
-// --- Test: S3Primary ordering invariant (Phase Laika) ---
+// --- Test: S3Primary ordering invariant ---
 // Verifies that the local manifest is never ahead of S3:
 // 1. With fake S3, sync should NOT persist a new manifest version locally.
 // 2. The local manifest file (if it exists) must have version <= 0 (what
@@ -686,7 +723,7 @@ static void testS3PrimaryOrderingInvariant() {
     std::printf("  PASS: testS3PrimaryOrderingInvariant\n");
 }
 
-// --- Test: local manifest not persisted before S3 upload (Phase Laika) ---
+// --- Test: local manifest not persisted before S3 upload ---
 // Verifies the specific fix: doSyncFile no longer persists the manifest
 // independently of flushPendingPageGroups. The manifest file should only
 // be updated when flushPendingPageGroups succeeds (S3 upload + putManifest).
@@ -730,29 +767,31 @@ static void testLocalManifestNotPersistedBeforeS3() {
 }
 
 int main() {
-    std::printf("=== Phase GraphZenith Tests ===\n");
+    std::printf("=== Manifest Sync/Apply Tests ===\n");
 
     testSyncNoDirtyPages();
     testSyncAfterWrite();
     testGetManifestVersion();
     testGetManifestVersionNoFile();
     testApplyManifestSameVersion();
+    testApplyManifestNoopSkipsRemotePreflight();
     testApplyManifestNewerVersion();
     testApplyManifestOlderVersion();
     testApplyManifestInvalidJSON();
     testApplyManifestNoFile();
     testJournalSeqSetDuringSync();
-    testApplyManifestInvalidatesChangedGroups();
+    testApplyManifestMissingPageGroupLeavesStateUnchanged();
     testSyncNoActiveFile();
     testApplyManifestGarbageJSON();
     testConcurrentApplyAndRead();
-    testOverrideContentInvalidation();
+    testApplyManifestMissingOverrideLeavesStateUnchanged();
+    testApplyManifestRejectsUnreadableSeekableShape();
     testApplyManifestPageSizeMismatch();
     testRPO0CrashRecovery();
     testS3UnreachableFallbackOnOpen();
     testS3PrimaryOrderingInvariant();
     testLocalManifestNotPersistedBeforeS3();
 
-    std::printf("All 20 Phase GraphZenith tests passed.\n");
+    std::printf("All manifest sync/apply tests passed.\n");
     return 0;
 }

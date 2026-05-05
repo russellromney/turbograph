@@ -1,4 +1,4 @@
-// Phase Volley: raw metadata parser for per-table prefetch schedules.
+// Raw metadata parser for per-table prefetch schedules.
 //
 // Parses LadybugDB's serialized StorageManager metadata pages during openFile()
 // to build a page-to-table mapping. Uses Kuzu's own Deserializer and type-level

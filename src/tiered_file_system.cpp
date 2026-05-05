@@ -389,11 +389,20 @@ void TieredFileSystem::drainPrefetchAndWait() const {
 }
 
 bool TieredFileSystem::canHandleFile(const std::string_view path) const {
+    if (std::getenv("TURBOGRAPH_DEBUG_CONFIG")) {
+        std::fprintf(stderr, "turbograph canHandleFile path=%.*s data_file=%s match=%s\n",
+            static_cast<int>(path.size()), path.data(), config_.dataFilePath.c_str(),
+            path == config_.dataFilePath ? "yes" : "no");
+    }
     return path == config_.dataFilePath;
 }
 
 std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& path,
     common::FileOpenFlags /*flags*/, main::ClientContext* /*context*/) {
+    if (std::getenv("TURBOGRAPH_DEBUG_CONFIG")) {
+        std::fprintf(stderr, "turbograph openFile path=%s data_file=%s cache_dir=%s\n",
+            path.c_str(), config_.dataFilePath.c_str(), config_.cacheDir.c_str());
+    }
     auto manifestPath = std::filesystem::path(config_.cacheDir) / "manifest.json";
     auto bitmapPath = std::filesystem::path(config_.cacheDir) / "page_bitmap";
     auto localFilePath = std::filesystem::path(config_.cacheDir) / "data.cache";
@@ -401,8 +410,8 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
     std::filesystem::create_directories(config_.cacheDir);
 
     // 1. Load manifest: disk first, then S3 fallback.
-    //    Phase GraphZenith: if local manifest exists, compare against S3 to
-    //    detect stale cache (S3 newer) or crash recovery (local "newer").
+    //    If local manifest exists, compare against S3 to detect stale cache
+    //    (S3 newer) or crash recovery (local "newer").
     Manifest m;
     bool manifestFound = false;
     bool needCacheInvalidation = false;
@@ -527,7 +536,7 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
 
     activeFileInfo_.store(info.get());
 
-    // Phase GraphZenith: cache invalidation when S3 manifest is newer or local is stale.
+    // Cache invalidation when S3 manifest is newer or local is stale.
     if (needCacheInvalidation && hasLocalManifest && m.pageCount > 0) {
         if (localManifest.version > m.version) {
             // Local "newer" (crash recovery): full invalidation.
@@ -585,7 +594,7 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
         }
     }
 
-    // --- Phase Beacon: Eager-fetch structural pages ---
+    // --- Eager-fetch structural pages ---
     // Fetch page 0 to check for Kuzu magic bytes. If valid, parse the database
     // header to discover catalog + metadata page ranges, then fetch all page
     // groups containing structural pages. This makes Database() construction
@@ -631,8 +640,8 @@ std::unique_ptr<common::FileInfo> TieredFileSystem::openFile(const std::string& 
                 }
             }
 
-            // --- Phase Volley: Parse metadata pages for per-table prefetch ---
-            // Metadata pages are now in local cache (Beacon fetched their groups).
+            // --- Parse metadata pages for per-table prefetch ---
+            // Metadata pages are now in local cache.
             // If a parser callback is registered (extension layer), read metadata
             // pages into a contiguous buffer and parse to build a page-to-table map.
             if (metadataParser_ && metaStart != UINT32_MAX && metaPages > 0) {
@@ -989,7 +998,7 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
         }
         subPPF = ti.manifest.subPagesPerFrame;
 
-        // Phase GraphDrift: check for subframe override.
+        // Check for subframe override.
         if (pageGroupId < ti.manifest.subframeOverrides.size()) {
             auto& ovMap = ti.manifest.subframeOverrides[pageGroupId];
             auto it = ovMap.find(static_cast<size_t>(frameIdx));
@@ -1005,7 +1014,7 @@ bool TieredFileSystem::fetchAndStoreFrame(TieredFileInfo& ti, uint64_t pageGroup
     std::optional<std::vector<uint8_t>> compressedFrame;
 
     if (hasOverride && !overrideKey.empty() && overrideEntry.len > 0) {
-        // Phase GraphDrift: fetch override object (full GET, not range GET).
+        // Fetch override object (full GET, not range GET).
         compressedFrame = ti.s3->getObject(overrideKey);
         if (!compressedFrame.has_value()) return false;
         entry = overrideEntry;
@@ -1169,7 +1178,7 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
             }
         }
 
-        // Phase GraphDrift: apply subframe overrides on top of base group.
+        // Apply subframe overrides on top of base group.
         // Override frames replace the corresponding base frames.
         std::unordered_map<size_t, SubframeOverride> overrides;
         {
@@ -1263,6 +1272,103 @@ bool TieredFileSystem::fetchAndStoreGroup(TieredFileInfo& ti, uint64_t pageGroup
     }
 
     return true;
+}
+
+bool TieredFileSystem::manifestObjectsAvailable(const Manifest& manifest) const {
+    std::vector<RangeRequest> requests;
+    requests.reserve(manifest.pageGroupKeys.size());
+
+    uint64_t tag = 0;
+    auto addProbe = [&](const std::string& key, uint64_t offset, uint64_t len) {
+        if (key.empty() || len == 0) {
+            return false;
+        }
+        requests.push_back({key, offset, len, tag++});
+        return true;
+    };
+
+    if (manifest.pageCount == 0) {
+        return true;
+    }
+
+    if (manifest.pageSize == 0 || manifest.pagesPerGroup == 0) {
+        return false;
+    }
+
+    auto requiredGroups =
+        (manifest.pageCount + manifest.pagesPerGroup - 1) / manifest.pagesPerGroup;
+    if (manifest.pageGroupKeys.size() < requiredGroups) {
+        return false;
+    }
+
+    for (uint64_t gid = 0; gid < requiredGroups; gid++) {
+        auto groupStart = gid * manifest.pagesPerGroup;
+        auto groupPages = std::min<uint64_t>(
+            manifest.pagesPerGroup, manifest.pageCount - groupStart);
+        const auto& baseKey = manifest.pageGroupKeys[gid];
+        const auto* overrides = gid < manifest.subframeOverrides.size()
+            ? &manifest.subframeOverrides[gid] : nullptr;
+        const auto* frameTable = gid < manifest.frameTables.size()
+            ? &manifest.frameTables[gid] : nullptr;
+
+        if (manifest.isSeekable()) {
+            if (manifest.subPagesPerFrame == 0) {
+                return false;
+            }
+
+            auto requiredFrames =
+                (groupPages + manifest.subPagesPerFrame - 1) / manifest.subPagesPerFrame;
+            for (uint64_t frameIdx = 0; frameIdx < requiredFrames; frameIdx++) {
+                auto overrideIt = overrides ? overrides->find(static_cast<size_t>(frameIdx))
+                                            : std::unordered_map<size_t, SubframeOverride>::const_iterator{};
+                bool hasOverride = overrides && overrideIt != overrides->end() &&
+                    overrideIt->second.entry.len > 0;
+                if (hasOverride) {
+                    if (overrideIt->second.entry.pageCount == 0 ||
+                        !addProbe(overrideIt->second.key, 0, overrideIt->second.entry.len)) {
+                        return false;
+                    }
+                    continue;
+                }
+
+                if (baseKey.empty() || !frameTable || frameIdx >= frameTable->size()) {
+                    return false;
+                }
+
+                const auto& entry = (*frameTable)[frameIdx];
+                if (entry.len == 0 || entry.pageCount == 0 ||
+                    !addProbe(baseKey, entry.offset, entry.len)) {
+                    return false;
+                }
+            }
+        } else if (!addProbe(baseKey, 0, 1)) {
+            return false;
+        }
+    }
+
+    for (const auto& overrides : manifest.subframeOverrides) {
+        for (const auto& [_, overrideFrame] : overrides) {
+            if (overrideFrame.entry.len == 0) continue;
+            if (overrideFrame.entry.pageCount == 0 ||
+                !addProbe(overrideFrame.key, 0, overrideFrame.entry.len)) {
+                return false;
+            }
+        }
+    }
+
+    if (requests.empty()) {
+        return true;
+    }
+
+    auto responses = s3_->getObjectRanges(requests);
+    std::unordered_set<uint64_t> found;
+    found.reserve(responses.size());
+    for (const auto& response : responses) {
+        if (!response.data.empty()) {
+            found.insert(response.tag);
+        }
+    }
+    return found.size() == requests.size();
 }
 
 // --- readOnePage: sync fetch + async prefetch ---
@@ -1649,7 +1755,7 @@ void TieredFileSystem::doSyncFile(TieredFileInfo& ti) const {
         for (auto pgId : affectedPageGroups) {
             ti.pendingPageGroups.insert(pgId);
         }
-        // Phase GraphDrift: track which pages within each group are dirty.
+        // Track which pages within each group are dirty.
         for (auto& [pageNum, _] : dirtySnapshot) {
             auto pgId = pageNum / ti.pagesPerGroup;
             auto localIdx = static_cast<uint32_t>(pageNum % ti.pagesPerGroup);
@@ -1659,14 +1765,14 @@ void TieredFileSystem::doSyncFile(TieredFileInfo& ti) const {
 
     ti.bitmap->persist();
 
-    // Phase GraphZenith: stamp journal_seq from config into manifest
+    // Stamp journal_seq from config into manifest
     // so followers know where to replay graphstream journal from.
     {
         std::lock_guard lock(ti.manifestMu);
         ti.manifest.journalSeq = config_.journalSeq;
     }
 
-    // Phase Laika: S3Primary ordering fix. Upload to S3 first, then persist
+    // S3Primary ordering: upload to S3 first, then persist
     // locally. flushPendingPageGroups() handles both the S3 upload and local
     // manifest persist in the correct order (S3 first, local second).
     // No separate local persist here; that was a bug that could leave the
@@ -1707,7 +1813,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
     bool useSeekable = config_.subPagesPerFrame > 0;
     std::unordered_map<uint64_t, std::vector<FrameEntry>> newFrameTables;
 
-    // Phase GraphDrift: override tracking.
+    // Subframe override tracking.
     // Carry forward existing overrides, then add/replace as needed.
     std::vector<std::unordered_map<size_t, SubframeOverride>> newSubframeOverrides;
     std::vector<std::string> staleOverrideKeys; // Old override keys to GC.
@@ -1726,7 +1832,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
     }
 
     for (auto pgId : pending) {
-        // Phase GraphDrift: determine dirty frames for override decision.
+        // Determine dirty frames for override decision.
         bool hasExistingFrameTable = false;
         {
             std::lock_guard lock(ti.manifestMu);
@@ -1753,7 +1859,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
             dirtyFrameSet.size() < effectiveThreshold;
 
         if (useOverride) {
-            // Phase GraphDrift: override path -- encode only dirty frames.
+            // Override path: encode only dirty frames.
             while (newSubframeOverrides.size() <= pgId) {
                 newSubframeOverrides.emplace_back();
             }
@@ -2021,7 +2127,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
         }
     }
 
-    // Phase GraphDrift: clear overrides for groups that got full rewrites.
+    // Clear overrides for groups that got full rewrites.
     for (auto pgId : fullRewriteGroups) {
         if (pgId < newSubframeOverrides.size()) {
             for (auto& [_, ov] : newSubframeOverrides[pgId]) {
@@ -2034,7 +2140,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
     newManifest.subframeOverrides = std::move(newSubframeOverrides);
     newManifest.normalizeOverrides();
 
-    // Phase GraphDrift: auto-compaction.
+    // Subframe override auto-compaction.
     // Groups that accumulated too many overrides get merged back into the base.
     if (config_.compactionThreshold > 0 && useSeekable) {
         std::vector<uint64_t> groupsToCompact;
@@ -2170,7 +2276,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
         }
     }
 
-    // Phase Laika: S3Primary ordering fix. Publish manifest to S3 FIRST,
+    // S3Primary ordering: publish manifest to S3 FIRST,
     // then persist locally. If we crash after S3 publish but before local
     // persist, the local manifest is behind S3, which is safe (we re-fetch
     // from S3 on reopen). The old order (local first, then S3) was a data
@@ -2190,7 +2296,7 @@ void TieredFileSystem::flushPendingPageGroups() const {
         ti.manifest = newManifest;
     }
 
-    // Phase GraphDrift: async GC of stale override keys.
+    // Async GC of stale override keys.
     for (auto& key : staleOverrideKeys) {
         ti.s3->deleteObject(key);
     }
@@ -2210,7 +2316,7 @@ uint64_t TieredFileSystem::evictStalePageGroups() {
 }
 
 // ============================================================================
-// Phase GraphZenith: hakuzu integration methods
+// Hakuzu integration methods
 // ============================================================================
 
 uint64_t TieredFileSystem::syncAndGetVersion() {
@@ -2260,10 +2366,26 @@ uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
             std::to_string(config_.pageSize));
     }
 
+    {
+        std::lock_guard lock(ti.manifestMu);
+        if (newManifest.version == ti.manifest.version) {
+            return newManifest.version;
+        }
+    }
+
+    if (!manifestObjectsAvailable(newManifest)) {
+        throw std::runtime_error(
+            "applyRemoteManifest: manifest references missing page objects");
+    }
+
     // Hold manifestMu across the entire operation to prevent concurrent readers
     // from seeing stale state between cache invalidation and manifest update.
     std::lock_guard lock(ti.manifestMu);
     Manifest oldManifest = ti.manifest;
+
+    if (newManifest.version == oldManifest.version) {
+        return newManifest.version;
+    }
 
     // If S3 version is older or equal, nothing to do (except crash recovery case).
     if (newManifest.version < oldManifest.version) {
@@ -2284,11 +2406,6 @@ uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
         }
         std::filesystem::rename(tmpPath, manifestPath);
 
-        return newManifest.version;
-    }
-
-    if (newManifest.version == oldManifest.version) {
-        // Same version, cache is warm.
         return newManifest.version;
     }
 
@@ -2386,7 +2503,7 @@ uint64_t TieredFileSystem::applyRemoteManifest(const std::string& jsonStr) {
 }
 
 // ============================================================================
-// Phase GraphTurbogenesis: wire methods
+// Wire manifest methods
 // ============================================================================
 
 static constexpr uint8_t TAG_PURE = 0x01;
@@ -2425,34 +2542,68 @@ std::vector<uint8_t> TieredFileSystem::manifestBytesWithGraphstreamDelta(
     return out;
 }
 
+DecodedManifestBytes TieredFileSystem::decodeManifestBytes(
+    const std::vector<uint8_t>& bytes) const {
+    if (bytes.empty()) {
+        throw std::runtime_error("decodeManifestBytes: empty input");
+    }
+
+    uint8_t tag = bytes[0];
+    std::vector<uint8_t> body(bytes.begin() + 1, bytes.end());
+    if (tag == TAG_PURE) {
+        auto manifest = Manifest::fromMsgpack(body);
+        if (!manifest.has_value()) {
+            throw std::runtime_error("decodeManifestBytes: failed to decode pure manifest");
+        }
+        DecodedManifestBytes decoded;
+        decoded.manifest = std::move(*manifest);
+        return decoded;
+    }
+
+    if (tag == TAG_HYBRID) {
+        auto payload = HybridPayload::fromMsgpack(body);
+        if (!payload.has_value()) {
+            throw std::runtime_error("decodeManifestBytes: failed to decode hybrid manifest");
+        }
+        DecodedManifestBytes decoded;
+        decoded.manifest = std::move(payload->turbograph);
+        decoded.hybrid = true;
+        decoded.graphstreamJournalSeq = payload->graphstream_journal_seq;
+        decoded.graphstreamSegmentPrefix = std::move(payload->graphstream_segment_prefix);
+        return decoded;
+    }
+
+    throw std::runtime_error(
+        "decodeManifestBytes: unknown wire tag: " + std::to_string(tag));
+}
+
+std::pair<uint64_t, std::string> TieredFileSystem::preflightManifestBytes(
+    const std::vector<uint8_t>& bytes) const {
+    auto decoded = decodeManifestBytes(bytes);
+    if (!manifestObjectsAvailable(decoded.manifest)) {
+        throw std::runtime_error(
+            "preflightManifestBytes: manifest references missing page objects");
+    }
+    return {decoded.graphstreamJournalSeq, decoded.graphstreamSegmentPrefix};
+}
+
 std::pair<uint64_t, std::string> TieredFileSystem::setManifestBytes(
     const std::vector<uint8_t>& bytes) {
-    if (bytes.empty()) {
-        throw std::runtime_error("setManifestBytes: empty input");
+    auto decoded = decodeManifestBytes(bytes);
+
+    if (auto* afi = activeFileInfo_.load()) {
+        std::lock_guard lock(afi->manifestMu);
+        if (decoded.manifest.version == afi->manifest.version) {
+            return {decoded.graphstreamJournalSeq, decoded.graphstreamSegmentPrefix};
+        }
     }
-    uint8_t tag = bytes[0];
-    if (tag == TAG_PURE) {
-        auto manifest = Manifest::fromMsgpack(
-            std::vector<uint8_t>(bytes.begin() + 1, bytes.end()));
-        if (!manifest.has_value()) {
-            throw std::runtime_error("setManifestBytes: failed to decode pure manifest");
-        }
-        applyRemoteManifest(manifest->toJSON());
-        return {0, ""};
-    } else if (tag == TAG_HYBRID) {
-        auto payload = HybridPayload::fromMsgpack(
-            std::vector<uint8_t>(bytes.begin() + 1, bytes.end()));
-        if (!payload.has_value()) {
-            throw std::runtime_error("setManifestBytes: failed to decode hybrid manifest");
-        }
-        // TODO(Phase GraphMeridian): skip the JSON detour by growing
-        // applyRemoteManifest(Manifest&&). See hakuzu ROADMAP.
-        applyRemoteManifest(payload->turbograph.toJSON());
-        return {payload->graphstream_journal_seq, payload->graphstream_segment_prefix};
-    } else {
+
+    if (!manifestObjectsAvailable(decoded.manifest)) {
         throw std::runtime_error(
-            "setManifestBytes: unknown wire tag: " + std::to_string(tag));
+            "setManifestBytes: manifest references missing page objects");
     }
+    applyRemoteManifest(decoded.manifest.toJSON());
+    return {decoded.graphstreamJournalSeq, decoded.graphstreamSegmentPrefix};
 }
 
 } // namespace tiered

@@ -1,4 +1,4 @@
-// Unit tests for Phase Glacier: automatic cache eviction.
+// Unit tests for automatic cache eviction.
 // No S3 required -- tests eviction logic using local write/sync/read paths.
 
 #include "tiered_file_system.h"

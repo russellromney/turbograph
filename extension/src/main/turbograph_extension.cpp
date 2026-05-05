@@ -7,12 +7,97 @@
 #include "main/database.h"
 #include "main/turbograph_functions.h"
 #include "tiered_file_system.h"
+#include "function/function.h"
+#include "function/scalar_function.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 namespace lbug {
 namespace turbograph_extension {
 
 tiered::TieredFileSystem* TurbographExtension::tfs = nullptr;
 main::Database* TurbographExtension::db = nullptr;
+
+static std::mutex& registryMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<main::Database*, tiered::TieredFileSystem*>& tfsRegistry() {
+    static std::unordered_map<main::Database*, tiered::TieredFileSystem*> registry;
+    return registry;
+}
+
+struct TurbographBindData final : function::FunctionBindData {
+    tiered::TieredFileSystem* tfs = nullptr;
+    main::Database* db = nullptr;
+
+    TurbographBindData(const function::ScalarBindFuncInput& input,
+        tiered::TieredFileSystem* boundTfs)
+        : FunctionBindData(common::LogicalType(
+              input.definition->ptrCast<function::ScalarOrAggregateFunction>()->returnTypeID)),
+          tfs(boundTfs),
+          db(input.context ? input.context->getDatabase() : nullptr) {}
+
+    TurbographBindData(std::vector<common::LogicalType> paramTypes,
+        common::LogicalType resultType, tiered::TieredFileSystem* boundTfs,
+        main::Database* boundDb)
+        : FunctionBindData(std::move(paramTypes), std::move(resultType)),
+          tfs(boundTfs),
+          db(boundDb) {}
+
+    std::unique_ptr<function::FunctionBindData> copy() const override {
+        return std::make_unique<TurbographBindData>(
+            common::LogicalType::copy(paramTypes), resultType.copy(), tfs, db);
+    }
+};
+
+static tiered::TieredFileSystem* registeredTfs(main::Database* database) {
+    std::lock_guard<std::mutex> guard(registryMutex());
+    auto it = tfsRegistry().find(database);
+    return it == tfsRegistry().end() ? nullptr : it->second;
+}
+
+static main::ClientContext* contextFromBindData(void* dataPtr) {
+    auto* bindData = reinterpret_cast<function::FunctionBindData*>(dataPtr);
+    return bindData ? bindData->clientContext : nullptr;
+}
+
+tiered::TieredFileSystem* TurbographExtension::tfsFromBindData(void* dataPtr) {
+    if (auto* bound = dynamic_cast<TurbographBindData*>(
+            reinterpret_cast<function::FunctionBindData*>(dataPtr))) {
+        if (bound->tfs) return bound->tfs;
+    }
+
+    auto* context = contextFromBindData(dataPtr);
+    auto* database = context ? context->getDatabase() : nullptr;
+    if (!database) return tfs;
+
+    std::lock_guard<std::mutex> guard(registryMutex());
+    auto it = tfsRegistry().find(database);
+    if (it != tfsRegistry().end() && it->second) return it->second;
+    return tfs;
+}
+
+main::Database* TurbographExtension::dbFromBindData(void* dataPtr) {
+    if (auto* bound = dynamic_cast<TurbographBindData*>(
+            reinterpret_cast<function::FunctionBindData*>(dataPtr))) {
+        if (bound->db) return bound->db;
+    }
+
+    auto* context = contextFromBindData(dataPtr);
+    if (context) return context->getDatabase();
+    return db;
+}
+
+std::unique_ptr<function::FunctionBindData> TurbographExtension::bindFunction(
+    const function::ScalarBindFuncInput& input) {
+    auto* database = input.context ? input.context->getDatabase() : nullptr;
+    return std::make_unique<TurbographBindData>(input, registeredTfs(database));
+}
 
 static tiered::TieredConfig configFromExtensionOptions(main::ClientContext* context) {
     tiered::TieredConfig cfg;
@@ -37,6 +122,67 @@ static tiered::TieredConfig configFromExtensionOptions(main::ClientContext* cont
     cfg.cacheDir = getOpt("turbograph_cache_dir");
 
     return cfg;
+}
+
+static std::string envFirst(std::initializer_list<const char*> names) {
+    for (auto* name : names) {
+        if (auto* value = std::getenv(name); value && value[0] != '\0') {
+            return value;
+        }
+    }
+    return "";
+}
+
+static void applyEnvFallbacks(tiered::TieredConfig& cfg) {
+    if (cfg.s3.accessKey.empty()) {
+        cfg.s3.accessKey = envFirst({
+            "TURBOGRAPH_S3_ACCESS_KEY",
+            "TIGRIS_STORAGE_ACCESS_KEY_ID",
+            "AWS_ACCESS_KEY_ID",
+        });
+    }
+    if (cfg.s3.secretKey.empty()) {
+        cfg.s3.secretKey = envFirst({
+            "TURBOGRAPH_S3_SECRET_KEY",
+            "TIGRIS_STORAGE_SECRET_ACCESS_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        });
+    }
+    if (cfg.s3.endpoint.empty()) {
+        cfg.s3.endpoint = envFirst({
+            "TURBOGRAPH_S3_ENDPOINT",
+            "TIGRIS_STORAGE_ENDPOINT",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_ENDPOINT_URL",
+        });
+    }
+    if (cfg.s3.bucket.empty()) {
+        cfg.s3.bucket = envFirst({
+            "TURBOGRAPH_S3_BUCKET",
+            "S3_TEST_BUCKET",
+            "AWS_BUCKET",
+        });
+    }
+    if (cfg.s3.prefix.empty()) {
+        cfg.s3.prefix = envFirst({
+            "TURBOGRAPH_S3_PREFIX",
+            "AWS_PREFIX",
+        });
+    }
+    if (cfg.s3.region.empty()) {
+        cfg.s3.region = envFirst({
+            "TURBOGRAPH_S3_REGION",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        });
+        if (cfg.s3.region.empty()) cfg.s3.region = "auto";
+    }
+    if (cfg.dataFilePath.empty()) {
+        cfg.dataFilePath = envFirst({"TURBOGRAPH_DATA_FILE"});
+    }
+    if (cfg.cacheDir.empty()) {
+        cfg.cacheDir = envFirst({"TURBOGRAPH_CACHE_DIR"});
+    }
 }
 
 static void registerExtensionOptions(main::Database* db) {
@@ -74,14 +220,21 @@ void TurbographExtension::load(main::ClientContext* context) {
     // Build config from options or env vars.
     auto cfg = configFromExtensionOptions(context);
 
-    // Fall back to env vars if options are empty.
-    if (cfg.s3.accessKey.empty()) {
-        auto ak = std::getenv("TIGRIS_STORAGE_ACCESS_KEY_ID");
-        auto sk = std::getenv("TIGRIS_STORAGE_SECRET_ACCESS_KEY");
-        auto ep = std::getenv("TIGRIS_STORAGE_ENDPOINT");
-        if (ak) cfg.s3.accessKey = ak;
-        if (sk) cfg.s3.secretKey = sk;
-        if (ep) cfg.s3.endpoint = ep;
+    // Static extensions load during Database construction, before callers can
+    // issue SET commands. Env fallbacks let embedded clients activate the VFS
+    // before lbug opens the database file we need to intercept.
+    applyEnvFallbacks(cfg);
+
+    if (std::getenv("TURBOGRAPH_DEBUG_CONFIG")) {
+        std::fprintf(stderr,
+            "turbograph config: access=%s secret=%s endpoint=%s bucket=%s prefix=%s data_file=%s cache_dir=%s\n",
+            cfg.s3.accessKey.empty() ? "missing" : "set",
+            cfg.s3.secretKey.empty() ? "missing" : "set",
+            cfg.s3.endpoint.empty() ? "missing" : cfg.s3.endpoint.c_str(),
+            cfg.s3.bucket.empty() ? "missing" : cfg.s3.bucket.c_str(),
+            cfg.s3.prefix.empty() ? "missing" : cfg.s3.prefix.c_str(),
+            cfg.dataFilePath.empty() ? "missing" : cfg.dataFilePath.c_str(),
+            cfg.cacheDir.empty() ? "missing" : cfg.cacheDir.c_str());
     }
 
     // Parse encryption key from env var or extension option.
@@ -101,18 +254,27 @@ void TurbographExtension::load(main::ClientContext* context) {
         }
     }
 
-    // Only register the TieredFileSystem if we have S3 credentials + data file path.
-    if (!cfg.s3.accessKey.empty() && !cfg.dataFilePath.empty()) {
+    // Only register the TieredFileSystem once per Database. Static linked
+    // extensions may be refreshed after checkpoint catalog load to restore UDF
+    // registrations; the UDFs must continue to point at the filesystem that
+    // actually intercepted the database file.
+    tiered::TieredFileSystem* activeTfs = registeredTfs(db);
+    if (!activeTfs && !cfg.s3.accessKey.empty() && !cfg.dataFilePath.empty()) {
         auto tfsPtr = std::make_unique<tiered::TieredFileSystem>(cfg);
-        tfs = tfsPtr.get();
+        activeTfs = tfsPtr.get();
         db->registerFileSystem(std::move(tfsPtr));
+    }
+    tfs = activeTfs;
+    {
+        std::lock_guard<std::mutex> guard(registryMutex());
+        tfsRegistry()[db] = activeTfs;
     }
 
     // Store Database pointer for table map builder (UDF manual rebuild path).
     TurbographExtension::db = db;
 
     // Register the raw metadata parser callback on the TFS.
-    // This runs during openFile() after Beacon fetches structural pages,
+    // This runs during openFile() after structural pages are fetched,
     // building a page-to-table map for per-table prefetch scheduling.
     if (tfs) {
         tfs->setMetadataParser([](const uint8_t* data, size_t len) {
@@ -124,13 +286,13 @@ void TurbographExtension::load(main::ClientContext* context) {
     extension::ExtensionUtils::addScalarFunc<TurbographConfigSetFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographConfigGetFunction>(*db);
 
-    // Phase GraphZenith: hakuzu integration UDFs.
+    // Hakuzu integration UDFs.
     extension::ExtensionUtils::addScalarFunc<TurbographSyncFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographGetManifestVersionFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographSetManifestFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographGetManifestFunction>(*db);
 
-    // Phase GraphTurbogenesis: opaque-payload wire UDFs.
+    // Opaque-payload wire UDFs.
     extension::ExtensionUtils::addScalarFunc<TurbographManifestBytesFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographManifestBytesWithGraphstreamDeltaFunction>(*db);
     extension::ExtensionUtils::addScalarFunc<TurbographSetManifestBytesFunction>(*db);

@@ -399,7 +399,7 @@ static void testFileSizeConsistency() {
 }
 
 // --- Test: second open reuses bitmap and local file from first session ---
-// Phase Laika: with S3Primary ordering fix, the manifest is only persisted
+// With S3Primary ordering, the manifest is only persisted
 // locally after a successful S3 upload. With fake S3 (uploads fail),
 // flushPendingPageGroups returns early, so the manifest stays at version 0
 // with pageCount=0. On reopen, the VFS sees a fresh database.
@@ -489,7 +489,7 @@ static void testEvictLocalGroup() {
     std::printf("  PASS: testEvictLocalGroup\n");
 }
 
-// --- Phase Vault: encrypted write -> sync -> read round-trip ---
+// --- Test: encrypted write -> sync -> read round-trip ---
 
 static TieredConfig makeEncryptedConfig(const std::filesystem::path& dir) {
     auto cfg = makeConfig(dir);
@@ -589,18 +589,12 @@ static void testEncryptedManifestFlag() {
 static void testWirePureManifestApplyAndRead() {
     Manifest original;
     original.version = 42;
-    original.pageCount = 800000;
+    original.pageCount = 0;
     original.pageSize = 4096;
     original.pagesPerGroup = 2048;
-    original.pageGroupKeys = {"prefix/pg/0_v1", "prefix/pg/1_v1", "prefix/pg/2_v42"};
     original.journalSeq = 12345;
     original.encrypted = true;
     original.subPagesPerFrame = 4;
-    original.frameTables = {{{0, 8192, 2}, {8192, 4096, 1}}};
-
-    std::unordered_map<size_t, SubframeOverride> ovr;
-    ovr[2] = SubframeOverride{"pg/0_f2_v42", FrameEntry{0, 4096, 4}};
-    original.subframeOverrides.push_back(ovr);
 
     auto body = original.toMsgpack();
     std::vector<uint8_t> tagged;
@@ -624,25 +618,13 @@ static void testWirePureManifestApplyAndRead() {
         std::vector<uint8_t>(readBack.begin() + 1, readBack.end()));
     assert(parsed.has_value());
     assert(parsed->version == 42);
-    assert(parsed->pageCount == 800000);
+    assert(parsed->pageCount == 0);
     assert(parsed->pageSize == 4096);
     assert(parsed->pagesPerGroup == 2048);
-    assert(parsed->pageGroupKeys.size() == 3);
-    assert(parsed->pageGroupKeys[0] == "prefix/pg/0_v1");
+    assert(parsed->pageGroupKeys.empty());
     assert(parsed->journalSeq == 12345);
     assert(parsed->encrypted == true);
     assert(parsed->subPagesPerFrame == 4);
-    assert(parsed->frameTables.size() == 1);
-    assert(parsed->frameTables[0].size() == 2);
-    assert(parsed->frameTables[0][0].offset == 0);
-    assert(parsed->frameTables[0][0].len == 8192);
-    assert(parsed->frameTables[0][0].pageCount == 2);
-    assert(parsed->subframeOverrides.size() == 3);
-    assert(parsed->subframeOverrides[0].size() == 1);
-    assert(parsed->subframeOverrides[0].at(2).key == "pg/0_f2_v42");
-    assert(parsed->subframeOverrides[0].at(2).entry.pageCount == 4);
-    assert(parsed->subframeOverrides[1].empty());
-    assert(parsed->subframeOverrides[2].empty());
 
     std::filesystem::remove_all(dir);
     std::printf("  PASS: testWirePureManifestApplyAndRead\n");
@@ -651,10 +633,9 @@ static void testWirePureManifestApplyAndRead() {
 static void testWireHybridManifestApplyAndRead() {
     Manifest original;
     original.version = 7;
-    original.pageCount = 100;
+    original.pageCount = 0;
     original.pageSize = 4096;
     original.pagesPerGroup = 2048;
-    original.pageGroupKeys = {"pg/0_v7"};
     original.journalSeq = 99;
 
     HybridPayload hybrid;
@@ -684,13 +665,13 @@ static void testWireHybridManifestApplyAndRead() {
     assert(parsed.has_value());
     assert(parsed->version == 7);
     assert(parsed->journalSeq == 99);
-    assert(parsed->pageGroupKeys[0] == "pg/0_v7");
+    assert(parsed->pageGroupKeys.empty());
 
     std::filesystem::remove_all(dir);
     std::printf("  PASS: testWireHybridManifestApplyAndRead\n");
 }
 
-static void testWireSubframeOverridesSurvive() {
+static void testWireSubframeOverridesDecodeWithoutActiveFile() {
     Manifest original;
     original.version = 5;
     original.pageCount = 50;
@@ -712,31 +693,25 @@ static void testWireSubframeOverridesSurvive() {
     auto dir = tmpDir();
     auto cfg = makeConfig(dir);
     TieredFileSystem vfs(cfg);
-    auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
-    vfs.setManifestBytes(tagged);
-
-    auto readBack = vfs.manifestBytes();
-    auto parsed = Manifest::fromMsgpack(
-        std::vector<uint8_t>(readBack.begin() + 1, readBack.end()));
-    assert(parsed.has_value());
-    assert(parsed->subframeOverrides.size() == 1);
-    assert(parsed->subframeOverrides[0].size() == 2);
-    assert(parsed->subframeOverrides[0].at(0).key == "pg/0_f0_v5");
-    assert(parsed->subframeOverrides[0].at(0).entry.len == 8192);
-    assert(parsed->subframeOverrides[0].at(3).key == "pg/0_f3_v5");
-    assert(parsed->subframeOverrides[0].at(3).entry.pageCount == 1);
+    auto decoded = vfs.decodeManifestBytes(tagged);
+    assert(!decoded.hybrid);
+    assert(decoded.manifest.subframeOverrides.size() == 1);
+    assert(decoded.manifest.subframeOverrides[0].size() == 2);
+    assert(decoded.manifest.subframeOverrides[0].at(0).key == "pg/0_f0_v5");
+    assert(decoded.manifest.subframeOverrides[0].at(0).entry.len == 8192);
+    assert(decoded.manifest.subframeOverrides[0].at(3).key == "pg/0_f3_v5");
+    assert(decoded.manifest.subframeOverrides[0].at(3).entry.pageCount == 1);
 
     std::filesystem::remove_all(dir);
-    std::printf("  PASS: testWireSubframeOverridesSurvive\n");
+    std::printf("  PASS: testWireSubframeOverridesDecodeWithoutActiveFile\n");
 }
 
 static void testWireManifestBytesWithGraphstreamDelta() {
     Manifest original;
     original.version = 3;
-    original.pageCount = 10;
+    original.pageCount = 0;
     original.pageSize = 4096;
     original.pagesPerGroup = 2048;
-    original.pageGroupKeys = {"pg/0_v3"};
 
     auto dir = tmpDir();
     auto cfg = makeConfig(dir);
@@ -765,7 +740,69 @@ static void testWireManifestBytesWithGraphstreamDelta() {
     std::printf("  PASS: testWireManifestBytesWithGraphstreamDelta\n");
 }
 
-// Phase GraphTurbogenesis: empty payload should be rejected by setManifestBytes
+static void testWireNoopSkipsRemotePreflight() {
+    Manifest original;
+    original.version = 0;
+    original.pageCount = PAGES_PER_GROUP;
+    original.pageSize = PAGE_SIZE;
+    original.pagesPerGroup = PAGES_PER_GROUP;
+    original.pageGroupKeys = {"missing/pg/0_v0"};
+
+    HybridPayload hybrid;
+    hybrid.turbograph = original;
+    hybrid.graphstream_journal_seq = 321;
+    hybrid.graphstream_segment_prefix = "gs/noop/";
+
+    auto body = hybrid.toMsgpack();
+    std::vector<uint8_t> tagged;
+    tagged.reserve(body.size() + 1);
+    tagged.push_back(0x02);
+    tagged.insert(tagged.end(), body.begin(), body.end());
+
+    auto dir = tmpDir();
+    auto cfg = makeConfig(dir);
+    TieredFileSystem vfs(cfg);
+    auto fi = vfs.openFile(cfg.dataFilePath, FileOpenFlags(FileFlags::WRITE));
+
+    auto result = vfs.setManifestBytes(tagged);
+    assert(result.first == 321);
+    assert(result.second == "gs/noop/");
+    assert(vfs.getManifestVersion() == 0);
+
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testWireNoopSkipsRemotePreflight\n");
+}
+
+static void testWirePreflightMissingObjectsWithoutActiveFile() {
+    Manifest original;
+    original.version = 9;
+    original.pageCount = 4;
+    original.pageSize = 4096;
+    original.pagesPerGroup = 4;
+    original.pageGroupKeys = {"missing/pg/0_v9"};
+
+    auto body = original.toMsgpack();
+    std::vector<uint8_t> tagged;
+    tagged.reserve(body.size() + 1);
+    tagged.push_back(0x01);
+    tagged.insert(tagged.end(), body.begin(), body.end());
+
+    auto dir = tmpDir();
+    auto cfg = makeConfig(dir);
+    TieredFileSystem vfs(cfg);
+
+    try {
+        vfs.preflightManifestBytes(tagged);
+        assert(false && "preflightManifestBytes should reject missing objects");
+    } catch (const std::runtime_error& e) {
+        assert(std::string(e.what()).find("missing page objects") != std::string::npos);
+    }
+
+    std::filesystem::remove_all(dir);
+    std::printf("  PASS: testWirePreflightMissingObjectsWithoutActiveFile\n");
+}
+
+// Empty payload should be rejected by setManifestBytes.
 static void testWireEmptyPayloadRejected() {
     auto dir = tmpDir();
     auto cfg = makeConfig(dir);
@@ -783,7 +820,7 @@ static void testWireEmptyPayloadRejected() {
     std::printf("  PASS: testWireEmptyPayloadRejected\n");
 }
 
-// Phase GraphTurbogenesis: unknown tag byte should be rejected
+// Unknown tag byte should be rejected.
 static void testWireWrongTagRejected() {
     auto dir = tmpDir();
     auto cfg = makeConfig(dir);
@@ -802,7 +839,7 @@ static void testWireWrongTagRejected() {
     std::printf("  PASS: testWireWrongTagRejected\n");
 }
 
-// Phase GraphTurbogenesis: malformed msgpack body should be rejected
+// Malformed msgpack body should be rejected.
 static void testWireMalformedMsgpackRejected() {
     auto dir = tmpDir();
     auto cfg = makeConfig(dir);
@@ -842,8 +879,10 @@ int main() {
     testEncryptedManifestFlag();
     testWirePureManifestApplyAndRead();
     testWireHybridManifestApplyAndRead();
-    testWireSubframeOverridesSurvive();
+    testWireSubframeOverridesDecodeWithoutActiveFile();
     testWireManifestBytesWithGraphstreamDelta();
+    testWireNoopSkipsRemotePreflight();
+    testWirePreflightMissingObjectsWithoutActiveFile();
     testWireEmptyPayloadRejected();
     testWireWrongTagRejected();
     testWireMalformedMsgpackRejected();

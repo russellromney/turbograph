@@ -9,8 +9,11 @@ description = "Rust handle for the turbograph tiered VFS — wraps Kuzu UDFs wit
 [dependencies]
 lbug = { version = "0.15", default-features = false }
 anyhow = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Off by default — tests need LBUG_STATIC_EXTENSIONS=turbograph + TURBOGRAPH_DIR.

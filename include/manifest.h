@@ -16,7 +16,7 @@ struct FrameEntry {
     uint32_t pageCount = 0;   // Actual number of pages encoded in this frame.
 };
 
-// Phase GraphDrift: a subframe override entry.
+// Subframe override entry.
 // When only a few frames in a group are dirty, we upload those frames as
 // independent S3 objects instead of rewriting the full group.
 struct SubframeOverride {
@@ -42,7 +42,7 @@ struct Manifest {
     // 0 = legacy format (no seekable frames).
     uint32_t subPagesPerFrame = 0;
 
-    // Phase GraphDrift: per-group subframe overrides.
+    // Per-group subframe overrides.
     // subframeOverrides[gid][frameIndex] = SubframeOverride.
     // When present, the override S3 object replaces the corresponding frame
     // in the base group for reads.
@@ -52,7 +52,7 @@ struct Manifest {
     // The key itself is never stored in the manifest.
     bool encrypted = false;
 
-    // Phase GraphZenith: graphstream journal position captured at checkpoint.
+    // Graphstream journal position captured at checkpoint.
     // Followers replay journal entries after this sequence.
     // Default 0 for backward compat with older manifests.
     uint64_t journalSeq = 0;
@@ -65,7 +65,7 @@ struct Manifest {
     std::string toJSON() const;
     static std::optional<Manifest> fromJSON(const std::string& json);
 
-    // Phase GraphTurbogenesis: msgpack wire serialization.
+    // Msgpack wire serialization.
     std::vector<uint8_t> toMsgpack() const;
     static std::optional<Manifest> fromMsgpack(const std::vector<uint8_t>& bytes);
 };

@@ -316,7 +316,7 @@ struct LatencyStats {
     }
 };
 
-// Phase Cypher: prepare query to get the plan, extract table IDs, prefetch their page groups.
+// Prepare query to get the plan, extract table IDs, prefetch their page groups.
 // Returns number of groups submitted (0 if no TFS or no table map).
 static uint64_t frontrunPrefetch(lbug::main::Connection& conn,
     lbug::tiered::TieredFileSystem* tfs, const char* cypher) {
@@ -465,7 +465,7 @@ int main(int argc, char** argv) {
     int64_t ckptMs = 0;
     uint64_t dbSizeBytes = 0;
 
-    // Phase 1: Load data (skip if DB already exists locally or in Tigris).
+    // Load data (skip if DB already exists locally or in Tigris).
     if (!dbExists) {
         // Clean up ALL stale local artifacts from previous crashed runs
         // (DB dir, cache dir, CSV data dir, shadow files, WAL files, etc.).
@@ -582,17 +582,17 @@ int main(int argc, char** argv) {
         (unsigned long long)(dbSizeBytes / (1024 * 1024)),
         (unsigned long long)bufferPoolMB);
 
-    // Phase 2: Four-level benchmark.
+    // Four-level benchmark.
     //
-    // Sequence (one shared TFS + DB for all phases):
+    // Sequence (one shared TFS + DB for all tiers):
     //   1. COLD:     clearCacheAll() between iterations. Nothing cached.
     //   2. INTERIOR: clearCacheKeepStructural() between iterations. Catalog+metadata cached.
     //   3. INDEX:    clearCacheKeepIndex() between iterations. Structural+index cached.
     //   4. WARM:     no cache clearing. Close/reopen Connection to nuke buffer pool.
     //
-    // After cold phase, transition to interior by doing clearCacheKeepStructural().
-    // After interior phase, transition to index by doing clearCacheKeepIndex().
-    // After index phase, all pages are cached for warm.
+    // After cold, transition to interior by doing clearCacheKeepStructural().
+    // After interior, transition to index by doing clearCacheKeepIndex().
+    // After index, all pages are cached for warm.
 
     LatencyStats coldStats[NUM_QUERIES];
     LatencyStats interiorStats[NUM_QUERIES];
@@ -607,7 +607,7 @@ int main(int argc, char** argv) {
             if (tfs) tfs->setActiveSchedule(QUERIES[q].schedule);
             lbug::main::Connection conn(&db);
 
-            // Phase Cypher: frontrun prefetch (skip for warm).
+            // Frontrun prefetch (skip for warm).
             if (std::strcmp(label, "warm") != 0) {
                 frontrunPrefetch(conn, tfs, QUERIES[q].cypher);
             }
@@ -634,7 +634,7 @@ int main(int argc, char** argv) {
     std::printf("  Running benchmark (%d/%d iterations)...\n",
         cfg.coldIterations, cfg.warmIterations);
 
-    // --- Phase 1: COLD (fresh TFS + DB per query, nothing cached) ---
+    // --- COLD (fresh TFS + DB per query, nothing cached) ---
     // Runs BEFORE the shared DB is created so there's no file lock conflict.
     // Each cold query gets its own TFS with a temp cache dir and a fresh Database.
     for (int iter = 0; iter < cfg.coldIterations; iter++) {
@@ -663,7 +663,7 @@ int main(int argc, char** argv) {
                 lbug::main::Database coldDb(dbPath, coldSysCfg, std::move(coldFsList));
                 lbug::main::Connection conn(&coldDb);
 
-                // Phase Cypher: frontrun prefetch before query execution.
+                // Frontrun prefetch before query execution.
                 auto submitted = frontrunPrefetch(conn, coldTfsPtr, QUERIES[q].cypher);
                 if (submitted > 0) {
                     std::printf("    [frontrun] %s: %llu groups\n",
@@ -692,7 +692,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- Phases 2-4: shared TFS + DB for interior/index/warm ---
+    // --- Shared TFS + DB for interior/index/warm ---
     {
         std::vector<std::unique_ptr<lbug::common::FileSystem>> fsList;
         lbug::tiered::TieredFileSystem* tfsPtr = nullptr;
@@ -732,7 +732,7 @@ int main(int argc, char** argv) {
         }
         if (tfsPtr) tfsPtr->endTrack();
 
-        // --- Phase 2: INTERIOR (structural cached, index+data evicted) ---
+        // --- INTERIOR (structural cached, index+data evicted) ---
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
             if (tfsPtr) tfsPtr->clearCacheKeepStructural();
             for (int q = 0; q < NUM_QUERIES; q++) {
@@ -740,10 +740,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Transition: keep structural+index for index phase.
+        // Transition: keep structural+index for index tier.
         if (tfsPtr) tfsPtr->clearCacheKeepIndex();
 
-        // --- Phase 3: INDEX (structural+index cached, data evicted) ---
+        // --- INDEX (structural+index cached, data evicted) ---
         for (int iter = 0; iter < cfg.coldIterations; iter++) {
             if (tfsPtr) tfsPtr->clearCacheKeepIndex();
             for (int q = 0; q < NUM_QUERIES; q++) {
@@ -751,7 +751,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // --- Phase 4: WARM (everything cached, nuke buffer pool via Connection close) ---
+        // --- WARM (everything cached, nuke buffer pool via Connection close) ---
         for (int iter = 0; iter < cfg.warmIterations; iter++) {
             for (int q = 0; q < NUM_QUERIES; q++) {
                 runQuery(db, s3Ptr, tfsPtr, q, iter, "warm", warmStats);

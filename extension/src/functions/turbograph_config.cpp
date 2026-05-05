@@ -20,9 +20,9 @@ using namespace common;
 
 static void configSetExec(const std::vector<std::shared_ptr<ValueVector>>& parameters,
     const std::vector<SelectionVector*>& parameterSelVectors, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
+    SelectionVector* resultSelVector, void* dataPtr) {
     result.resetAuxiliaryBuffer();
-    auto* tfs = TurbographExtension::tfs;
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto keyPos = (*parameterSelVectors[0])[i];
@@ -66,7 +66,7 @@ static void configSetExec(const std::vector<std::shared_ptr<ValueVector>>& param
         } else if (key == "table_map") {
             // Build or clear the page-to-table mapping for per-table prefetch.
             if (val == "build") {
-                auto* db = TurbographExtension::db;
+                auto* db = TurbographExtension::dbFromBindData(dataPtr);
                 if (!db) {
                     StringVector::addString(&result, resultPos,
                         std::string("error: database not available"));
@@ -100,9 +100,11 @@ static void configSetExec(const std::vector<std::shared_ptr<ValueVector>>& param
 
 function_set TurbographConfigSetFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
+    auto fn = std::make_unique<ScalarFunction>(name,
         std::vector<LogicalTypeID>{LogicalTypeID::STRING, LogicalTypeID::STRING},
-        LogicalTypeID::STRING, configSetExec));
+        LogicalTypeID::STRING, configSetExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 
@@ -110,9 +112,9 @@ function_set TurbographConfigSetFunction::getFunctionSet() {
 
 static void configGetExec(const std::vector<std::shared_ptr<ValueVector>>& parameters,
     const std::vector<SelectionVector*>& parameterSelVectors, ValueVector& result,
-    SelectionVector* resultSelVector, void* /*dataPtr*/) {
+    SelectionVector* resultSelVector, void* dataPtr) {
     result.resetAuxiliaryBuffer();
-    auto* tfs = TurbographExtension::tfs;
+    auto* tfs = TurbographExtension::tfsFromBindData(dataPtr);
 
     for (auto i = 0u; i < resultSelVector->getSelSize(); i++) {
         auto keyPos = (*parameterSelVectors[0])[i];
@@ -148,9 +150,11 @@ static void configGetExec(const std::vector<std::shared_ptr<ValueVector>>& param
 
 function_set TurbographConfigGetFunction::getFunctionSet() {
     function_set result;
-    result.push_back(std::make_unique<ScalarFunction>(name,
+    auto fn = std::make_unique<ScalarFunction>(name,
         std::vector<LogicalTypeID>{LogicalTypeID::STRING},
-        LogicalTypeID::STRING, configGetExec));
+        LogicalTypeID::STRING, configGetExec);
+    fn->bindFunc = TurbographExtension::bindFunction;
+    result.push_back(std::move(fn));
     return result;
 }
 

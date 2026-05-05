@@ -1,4 +1,4 @@
-// Phase Cypher: Query plan frontrunning.
+// Query plan frontrunning.
 //
 // Before executing a Cypher query, prepare it to get the logical plan,
 // walk the plan tree to find which tables will be accessed, and

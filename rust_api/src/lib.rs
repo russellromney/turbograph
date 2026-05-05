@@ -25,6 +25,10 @@ impl TurbographVfs {
         tokio::task::spawn_blocking(move || {
             let conn = lbug::Connection::new(&db)
                 .map_err(|e| anyhow!("turbograph: failed to create connection: {e}"))?;
+            let mut checkpoint = conn
+                .query("CHECKPOINT")
+                .map_err(|e| anyhow!("turbograph CHECKPOINT before sync failed: {e}"))?;
+            while checkpoint.next().is_some() {}
             let mut result = conn
                 .query("RETURN turbograph_sync()")
                 .map_err(|e| anyhow!("turbograph_sync() failed: {e}"))?;

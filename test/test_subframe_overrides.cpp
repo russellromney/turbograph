@@ -1,4 +1,4 @@
-// Phase GraphDrift: subframe override tests.
+// Subframe override tests.
 //
 // Tests the override write path, override read path, auto-compaction, and
 // manifest round-trip with subframe overrides.
@@ -29,8 +29,9 @@ static constexpr uint32_t PAGE_SIZE = 4096;
 static constexpr uint32_t PAGES_PER_GROUP = 8;
 static constexpr uint32_t SUB_PAGES_PER_FRAME = 2;
 
-static std::filesystem::path tmpDir(const char* suffix = "drift") {
-    auto dir = std::filesystem::temp_directory_path() / ("tiered_drift_test_" + std::string(suffix));
+static std::filesystem::path tmpDir(const char* suffix = "subframe") {
+    auto dir = std::filesystem::temp_directory_path() /
+        ("tiered_subframe_override_test_" + std::string(suffix));
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     return dir;
@@ -40,7 +41,8 @@ static TieredConfig makeConfig(const std::filesystem::path& dir,
     uint32_t overrideThreshold = 2,
     uint32_t compactionThreshold = 8) {
     TieredConfig cfg;
-    cfg.s3 = {"https://localhost:1", "fake-bucket", "test/drift", "auto", "fake-ak", "fake-sk", 1};
+    cfg.s3 = {"https://localhost:1", "fake-bucket", "test/subframe_overrides", "auto",
+              "fake-ak", "fake-sk", 1};
     cfg.cacheDir = (dir / "cache").string();
     cfg.dataFilePath = (dir / "data.kz").string();
     cfg.pageSize = PAGE_SIZE;
@@ -594,7 +596,7 @@ static void testManifestMultiGroupOverrides() {
 }
 
 int main() {
-    std::printf("=== Phase GraphDrift Tests ===\n");
+    std::printf("=== Subframe Override Tests ===\n");
 
     // Manifest tests.
     testManifestRoundTrip();
@@ -618,6 +620,6 @@ int main() {
     testDisabledOverrides();
     testNewGroupNoOverride();
 
-    std::printf("All Phase GraphDrift tests passed.\n");
+    std::printf("All subframe override tests passed.\n");
     return 0;
 }

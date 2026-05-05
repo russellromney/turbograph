@@ -65,7 +65,7 @@ public:
     // Immutable page group key: {prefix}/pg/{groupId}_v{manifestVersion}.
     std::string pageGroupKey(uint64_t groupId, uint64_t manifestVersion) const;
 
-    // Phase GraphDrift: override frame key: {prefix}/pg/{gid}_f{frameIdx}_v{version}.
+    // Override frame key: {prefix}/pg/{gid}_f{frameIdx}_v{version}.
     std::string overrideFrameKey(uint64_t groupId, size_t frameIdx,
         uint64_t manifestVersion) const;
 

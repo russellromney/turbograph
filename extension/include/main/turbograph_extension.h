@@ -1,8 +1,16 @@
 #pragma once
 
 #include "extension/extension.h"
+#include "function/function.h"
+
+#include <memory>
 
 namespace lbug {
+namespace main {
+class ClientContext;
+class Database;
+}
+
 namespace tiered {
 class TieredFileSystem;
 }
@@ -14,21 +22,17 @@ public:
     static constexpr char EXTENSION_NAME[] = "TURBOGRAPH";
 
     static void load(main::ClientContext* context);
+    static tiered::TieredFileSystem* tfsFromBindData(void* dataPtr);
+    static main::Database* dbFromBindData(void* dataPtr);
+    static std::unique_ptr<function::FunctionBindData> bindFunction(
+        const function::ScalarBindFuncInput& input);
 
-    // Global pointer to the active TieredFileSystem, set once during load().
-    // Used by UDFs to call setActiveSchedule(), s3() etc.
-    //
-    // Thread safety: set exactly once during load() (before any UDF can execute),
-    // read-only thereafter. The TFS itself has internal mutexes for all mutable
-    // state. Safe for concurrent UDF execution from multiple connections.
-    //
-    // Limitation: assumes one TieredFileSystem per process. If multiple Database
-    // instances load the extension, the last one's TFS wins. This is acceptable
-    // because turbograph intercepts a single data file path.
+    // Fallback pointer for legacy single-DB callers. UDFs should prefer
+    // tfsFromBindData() so multiple embedded databases in one process do not
+    // stomp each other's active TieredFileSystem.
     static tiered::TieredFileSystem* tfs;
 
-    // Global pointer to the Database, set once during load().
-    // Used by table_map builder to access StorageManager and Catalog.
+    // Fallback database pointer for legacy single-DB callers.
     static main::Database* db;
 };
 

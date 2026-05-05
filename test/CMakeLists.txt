@@ -34,12 +34,12 @@ add_executable(test_table_page_map test_table_page_map.cpp)
 target_link_libraries(test_table_page_map PRIVATE turbograph)
 add_test(NAME TablePageMapTest COMMAND test_table_page_map)
 
-# Unit test: crypto (Phase Vault)
+# Unit test: crypto
 add_executable(test_crypto test_crypto.cpp)
 target_link_libraries(test_crypto PRIVATE turbograph)
 add_test(NAME CryptoTest COMMAND test_crypto)
 
-# Unit test: cache eviction (Phase Glacier)
+# Unit test: cache eviction
 add_executable(test_eviction test_eviction.cpp)
 target_link_libraries(test_eviction PRIVATE turbograph)
 add_test(NAME EvictionTest COMMAND test_eviction)
@@ -79,17 +79,17 @@ add_executable(test_vfs test_vfs.cpp)
 target_link_libraries(test_vfs PRIVATE turbograph)
 add_test(NAME VFSTest COMMAND test_vfs)
 
-# Unit test: Phase GraphDrift (subframe overrides)
-add_executable(test_drift test_drift.cpp)
-target_link_libraries(test_drift PRIVATE turbograph)
-add_test(NAME DriftTest COMMAND test_drift)
+# Unit test: subframe overrides
+add_executable(test_subframe_overrides test_subframe_overrides.cpp)
+target_link_libraries(test_subframe_overrides PRIVATE turbograph)
+add_test(NAME SubframeOverrideTest COMMAND test_subframe_overrides)
 
 # Integration test: VFS end-to-end with S3
 add_executable(test_vfs_s3 test_vfs_s3.cpp)
 target_link_libraries(test_vfs_s3 PRIVATE turbograph)
 add_test(NAME VFSS3Test COMMAND test_vfs_s3)
 
-# Unit test: Phase GraphZenith (journal_seq, sync/getVersion/applyManifest, cache validation)
-add_executable(test_zenith test_zenith.cpp)
-target_link_libraries(test_zenith PRIVATE turbograph)
-add_test(NAME ZenithTest COMMAND test_zenith)
+# Unit test: manifest sync/apply, journal_seq, and cache validation
+add_executable(test_manifest_apply test_manifest_apply.cpp)
+target_link_libraries(test_manifest_apply PRIVATE turbograph)
+add_test(NAME ManifestApplyTest COMMAND test_manifest_apply)

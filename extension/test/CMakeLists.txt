@@ -18,10 +18,12 @@ else()
     message(FATAL_ERROR "Cannot find LadybugDB build dir. Build LadybugDB first: cd ${LADYBUG_DIR} && make release")
 endif()
 
-# Find liblbug static library.
-find_library(LBUG_LIB NAMES lbug
-    HINTS "${LBUG_BUILD_DIR}/src" "${LBUG_BUILD_DIR}/lib"
-    NO_DEFAULT_PATH)
+set(LBUG_LIB "${LBUG_BUILD_DIR}/src/liblbug.a")
+if(NOT EXISTS "${LBUG_LIB}")
+    find_library(LBUG_LIB NAMES lbug
+        HINTS "${LBUG_BUILD_DIR}/src" "${LBUG_BUILD_DIR}/lib"
+        NO_DEFAULT_PATH)
+endif()
 if(NOT LBUG_LIB)
     message(FATAL_ERROR "Cannot find liblbug. Build LadybugDB first: cd ${LADYBUG_DIR} && make release")
 endif()
@@ -32,6 +34,7 @@ add_executable(test_turbograph_extension
     test_turbograph_extension.cpp
     ${TURBOGRAPH_ROOT}/extension/src/main/turbograph_extension.cpp
     ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_config.cpp
+    ${TURBOGRAPH_ROOT}/extension/src/functions/turbograph_manifest.cpp
     ${TURBOGRAPH_ROOT}/extension/src/functions/table_map_builder.cpp
     ${TURBOGRAPH_ROOT}/extension/src/functions/plan_prefetch.cpp
     ${TURBOGRAPH_ROOT}/src/s3_client.cpp

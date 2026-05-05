@@ -412,7 +412,7 @@ uint64_t S3Client::evictStalePageGroups(const Manifest& manifest) {
     std::unordered_set<std::string> validKeys(
         manifest.pageGroupKeys.begin(), manifest.pageGroupKeys.end());
 
-    // Phase GraphDrift: override keys are also valid.
+    // Override keys are also valid.
     for (auto& ovMap : manifest.subframeOverrides) {
         for (auto& [_, ov] : ovMap) {
             validKeys.insert(ov.key);
