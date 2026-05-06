@@ -126,6 +126,44 @@ static void testCanHandleOnlyConfiguredDataFile() {
     std::printf("  PASS: testCanHandleOnlyConfiguredDataFile\n");
 }
 
+static void testCanonicalGraphIdSurvivesLocalPathChange() {
+    auto path = dbPath("canonical_id_fs.db");
+    {
+        SqliteGraphFileSystemConfig cfg;
+        cfg.sqlitePath = path;
+        cfg.dataFilePath = "/tmp/graph-a/data.kz";
+        cfg.dataFileId = "graph:stable-id";
+        cfg.graphPageSize = 128;
+        SqliteGraphFileSystem fs(std::move(cfg));
+
+        auto fi = fs.openFile("/tmp/graph-a/data.kz",
+            FileOpenFlags(FileFlags::WRITE | FileFlags::CREATE_IF_NOT_EXISTS));
+        std::vector<uint8_t> data(300);
+        for (size_t i = 0; i < data.size(); i++) data[i] = static_cast<uint8_t>((i * 7) & 0xFF);
+        fi->writeFile(data.data(), data.size(), 0);
+        assert(fs.fileOrPathExists("/tmp/graph-a/data.kz"));
+        assert(!fs.pageStore().fileExists("/tmp/graph-a/data.kz"));
+        assert(fs.pageStore().fileExists("graph:stable-id"));
+    }
+    {
+        SqliteGraphFileSystemConfig cfg;
+        cfg.sqlitePath = path;
+        cfg.dataFilePath = "/tmp/graph-b/data.kz";
+        cfg.dataFileId = "graph:stable-id";
+        cfg.graphPageSize = 128;
+        SqliteGraphFileSystem fs(std::move(cfg));
+
+        assert(fs.canHandleFile("/tmp/graph-b/data.kz"));
+        assert(fs.fileOrPathExists("/tmp/graph-b/data.kz"));
+        auto fi = fs.openFile("/tmp/graph-b/data.kz", FileOpenFlags(FileFlags::READ_ONLY));
+        std::vector<uint8_t> got(300);
+        fi->readFromFile(got.data(), got.size(), 0);
+        for (size_t i = 0; i < got.size(); i++) assert(got[i] == static_cast<uint8_t>((i * 7) & 0xFF));
+    }
+
+    std::printf("  PASS: testCanonicalGraphIdSurvivesLocalPathChange\n");
+}
+
 int main() {
     std::printf("SqliteGraphFileSystem tests...\n");
     testFileInfoReadWriteTruncate();
@@ -134,6 +172,7 @@ int main() {
     testGraphAndSqlitePageSizesCanDiverge();
     testCreateEmptyFileExists();
     testCanHandleOnlyConfiguredDataFile();
+    testCanonicalGraphIdSurvivesLocalPathChange();
     std::printf("All SqliteGraphFileSystem tests passed.\n");
     return 0;
 }

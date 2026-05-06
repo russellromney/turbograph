@@ -14,6 +14,7 @@ namespace tiered {
 struct SqliteGraphFileSystemConfig {
     std::string sqlitePath;
     std::string dataFilePath;
+    std::string dataFileId;
     uint32_t graphPageSize = 4096;
     uint32_t sqlitePageSize = 0;
     uint32_t sqliteWalAutoCheckpointPages = 1000;
@@ -68,7 +69,10 @@ protected:
     void truncate(common::FileInfo& fileInfo, uint64_t size) const override;
 
 private:
+    std::string fileIdForPath(const std::string& path) const;
+
     std::string dataFilePath_;
+    std::string dataFileId_;
     mutable SqlitePageStore store_;
 };
 

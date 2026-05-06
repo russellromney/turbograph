@@ -575,6 +575,7 @@ static std::unique_ptr<lbug::common::FileSystem> makeSqliteGraphFileSystem(
     lbug::tiered::SqliteGraphFileSystemConfig cfg;
     cfg.sqlitePath = paths.sqlitePath;
     cfg.dataFilePath = paths.dbPath;
+    cfg.dataFileId = envString("BENCH_GRAPH_ID").value_or(paths.dbPath);
     cfg.graphPageSize = 4096;
     cfg.sqlitePageSize = 65536;
     cfg.sqliteWalAutoCheckpointPages =

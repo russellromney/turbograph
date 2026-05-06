@@ -263,6 +263,32 @@ machinery.
   `cache_size=0`, and a chosen `synchronous` mode before running the
   turbolite-backed smoke
 
+### g. Toward A Real Turbolite-Backed Turbograph
+- [x] Write down the product/backend shape in
+  `docs/matryoshka_turbograph_design.md`
+  - Core decision: Turbograph should become a graph-aware adapter over a
+    Turbolite-backed SQLite application file, not a second replication stack.
+  - Product contract: explicit graph id, explicit publish epoch, single writer,
+    many readers pinned to published epochs.
+- [x] Start removing local-path identity from the graph page store
+  - Added `SqliteGraphFileSystemConfig::dataFileId` plus
+    `TURBOGRAPH_GRAPH_ID` / `turbograph_graph_id` / `BENCH_GRAPH_ID` plumbing.
+  - The intercepted Kuzu data file can now be stored under a stable graph id
+    rather than the absolute local DB path.
+  - Added a FileSystem test proving data written through `/tmp/graph-a/data.kz`
+    can be reopened through `/tmp/graph-b/data.kz` when both map to the same
+    canonical graph id.
+- [ ] Make the SQLite DB/container identity stable too
+  - True clone still needs the same SQLite database identity/name because that
+    is what Turbolite sees underneath SQLite. Next step: derive SQLite local
+    path from graph id while keeping the remote Turbolite prefix stable, or add
+    a Turbolite-side logical database identity.
+- [ ] Add a real `turbograph_publish()` Matryoshka path
+  - It should own: graph checkpoint, graph/catalog drain boundary, SQLite
+    checkpoint, Turbolite flush, and returned manifest/version/counters.
+- [ ] Debug the 250k/1M COPY segfault with `sqlite`/`turbolite`/`turbolite-s3`
+  matrix under `lldb`
+
 ---
 
 ## Phase Glacier: Automatic Cache Eviction

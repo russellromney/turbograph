@@ -25,6 +25,7 @@ const SqliteGraphFileInfo& asSqliteInfo(const common::FileInfo& fileInfo) {
 
 SqliteGraphFileSystem::SqliteGraphFileSystem(SqliteGraphFileSystemConfig config)
     : FileSystem(), dataFilePath_(std::move(config.dataFilePath)),
+      dataFileId_(std::move(config.dataFileId)),
       store_(std::move(config.sqlitePath), config.graphPageSize,
                         std::move(config.sqliteVfsName),
                         std::move(config.sqliteLoadableExtensionPath),
@@ -32,6 +33,13 @@ SqliteGraphFileSystem::SqliteGraphFileSystem(SqliteGraphFileSystemConfig config)
                         config.sqliteWalAutoCheckpointPages,
                         config.sqliteCacheSizePages,
                         std::move(config.sqliteSynchronous)) {}
+
+std::string SqliteGraphFileSystem::fileIdForPath(const std::string& path) const {
+    if (!dataFileId_.empty() && path == dataFilePath_) {
+        return dataFileId_;
+    }
+    return path;
+}
 
 std::unique_ptr<common::FileInfo> SqliteGraphFileSystem::openFile(
     const std::string& path, common::FileOpenFlags flags, main::ClientContext*) {
@@ -42,22 +50,22 @@ std::unique_ptr<common::FileInfo> SqliteGraphFileSystem::openFile(
         if (readOnly) {
             throw std::runtime_error("cannot truncate a read-only SqliteGraphFileSystem file");
         }
-        store_.truncate(path, 0);
+        store_.truncate(fileIdForPath(path), 0);
     } else if (!readOnly && hasFlag(flags, common::FileFlags::CREATE_IF_NOT_EXISTS) &&
                !fileOrPathExists(path)) {
-        store_.truncate(path, 0);
+        store_.truncate(fileIdForPath(path), 0);
     }
 
     if (readOnly && !fileOrPathExists(path)) {
         throw std::runtime_error("SqliteGraphFileSystem file does not exist: " + path);
     }
 
-    return std::make_unique<SqliteGraphFileInfo>(path, this, readOnly);
+    return std::make_unique<SqliteGraphFileInfo>(fileIdForPath(path), this, readOnly);
 }
 
 std::vector<std::string> SqliteGraphFileSystem::glob(main::ClientContext*,
     const std::string& path) const {
-    if (store_.fileExists(path)) {
+    if (store_.fileExists(fileIdForPath(path))) {
         return {path};
     }
     return {};
@@ -74,7 +82,7 @@ void SqliteGraphFileSystem::syncFile(const common::FileInfo&) const {
 
 bool SqliteGraphFileSystem::fileOrPathExists(const std::string& path,
     main::ClientContext*) {
-    return store_.fileExists(path);
+    return store_.fileExists(fileIdForPath(path));
 }
 
 void SqliteGraphFileSystem::readFromFile(common::FileInfo& fileInfo, void* buffer,

@@ -311,6 +311,8 @@ static void registerExtensionOptions(main::Database* db) {
     // because non-memory databases need the filesystem before data.kz opens.
     db->addExtensionOption("turbograph_sqlite_page_store", common::LogicalTypeID::STRING,
         common::Value{std::string("")});
+    db->addExtensionOption("turbograph_graph_id", common::LogicalTypeID::STRING,
+        common::Value{std::string("")});
     db->addExtensionOption("turbograph_sqlite_vfs", common::LogicalTypeID::STRING,
         common::Value{std::string("")});
     db->addExtensionOption("turbograph_sqlite_load_extension", common::LogicalTypeID::STRING,
@@ -368,6 +370,10 @@ void TurbographExtension::load(main::ClientContext* context) {
     auto sqliteLoadExtension = getSettingString(context, "turbograph_sqlite_load_extension");
     if (sqliteLoadExtension.empty()) {
         sqliteLoadExtension = envFirst({"TURBOGRAPH_SQLITE_LOAD_EXTENSION"});
+    }
+    auto graphId = getSettingString(context, "turbograph_graph_id");
+    if (graphId.empty()) {
+        graphId = envFirst({"TURBOGRAPH_GRAPH_ID"});
     }
     auto sqlitePageSize = envU32("TURBOGRAPH_SQLITE_PAGE_SIZE").value_or(0);
     auto sqliteWalAutoCheckpointPages =
@@ -432,6 +438,7 @@ void TurbographExtension::load(main::ClientContext* context) {
         tiered::SqliteGraphFileSystemConfig sqliteCfg;
         sqliteCfg.sqlitePath = sqlitePageStore;
         sqliteCfg.dataFilePath = cfg.dataFilePath;
+        sqliteCfg.dataFileId = graphId.empty() ? cfg.dataFilePath : graphId;
         sqliteCfg.graphPageSize = 4096;
         sqliteCfg.sqlitePageSize = sqlitePageSize;
         sqliteCfg.sqliteWalAutoCheckpointPages = sqliteWalAutoCheckpointPages;
